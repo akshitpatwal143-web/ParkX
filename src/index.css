@@ -1,0 +1,77 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+/* Completely hide scrollbar on screen */
+::-webkit-scrollbar {
+  display: none;
+  width: 0px;
+  height: 0px;
+  background: transparent;
+}
+* {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Base body adjustments */
+html, body {
+  background-color: #080808;
+  color: #f5f5f7;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  overflow-x: hidden;
+  margin: 0;
+  padding: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Luxury typography styling */
+h1, h2, h3, .font-display {
+  font-family: 'Space Grotesk', -apple-system, sans-serif;
+  letter-spacing: -0.03em;
+}
+
+.font-mono {
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* Subtle luxury glow effect */
+.glow-accent {
+  box-shadow: 0 0 35px -5px rgba(46, 230, 202, 0.25);
+}
+
+.glow-border {
+  border-color: rgba(46, 230, 202, 0.35);
+  box-shadow: inset 0 0 20px rgba(46, 230, 202, 0.05);
+}
+
+/* Automotive grid pattern */
+.bg-radar-grid {
+  background-size: 40px 40px;
+  background-image: 
+    linear-gradient(to right, rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+}
+
+/* Smooth link expand microinteraction */
+.link-hover-line {
+  position: relative;
+}
+.link-hover-line::after {
+  content: '';
+  position: absolute;
+  bottom: -2px;
+  left: 0;
+  width: 0%;
+  height: 1px;
+  background-color: #2ee6ca;
+  transition: width 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.link-hover-line:hover::after {
+  width: 100%;
+}
