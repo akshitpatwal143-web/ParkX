@@ -1,0 +1,2 @@
+UPDATE users SET email = LOWER(TRIM(email));
+ALTER TABLE users MODIFY email VARCHAR(254) NOT NULL;
