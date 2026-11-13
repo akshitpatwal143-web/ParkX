@@ -1,11 +1,17 @@
-
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
     {
-      "source": "/(.*)",
+      "source": "/api",
+      "destination": "https://parkx-backend-uuza.onrender.com/api"
+    },
+    {
+      "source": "/api/:path*",
+      "destination": "https://parkx-backend-uuza.onrender.com/api/:path*"
+    },
+    {
+      "source": "/((?!api(?:/|$)).*)",
       "destination": "/index.html"
     }
   ]
 }
-
