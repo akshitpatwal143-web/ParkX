@@ -1,11 +1,26 @@
-import 'dotenv/config';
-import { randomBytes, randomUUID } from 'node:crypto';
+import dotenv from 'dotenv';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+const __serverDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+dotenv.config();
+dotenv.config({ path: path.join(__serverDir, '.env') });
+
+import { randomBytes, randomUUID } from 'node:crypto';
 import express from 'express';
 import cors from 'cors';
 import session from 'express-session';
 import MySQLStoreFactory from 'express-mysql-session';
-import { getPool } from './db.js';
+import {
+  getPool,
+  verifyDatabaseReadiness,
+  sanitizeDbErrorCode,
+  createPoolConfig,
+  DEFAULT_DB_CONNECTION_LIMIT,
+  MAX_DB_CONNECTION_LIMIT,
+  parseConnectionLimit,
+  parseDbSsl,
+} from './db.js';
 import { createAuthRouter } from './routes/auth.js';
 import { createVehiclesRouter } from './routes/vehicles.js';
 import { createPublicRouter } from './routes/public.js';
@@ -85,7 +100,9 @@ export function createApp({
   signupLimiter,
   publicLimiter,
   vehicleLogger = console,
+  logger,
 } = {}) {
+  const activeLogger = logger || vehicleLogger || console;
   const { origins, secret, sameSite } = validateRuntimeConfig(env);
   const app = express();
   app.disable('x-powered-by');
@@ -137,13 +154,46 @@ export function createApp({
   }));
 
   app.use('/api/auth', createAuthRouter({ pool, origins, loginLimiter, signupLimiter }));
-  app.use('/api/vehicles', createVehiclesRouter({ pool, origins, logger: vehicleLogger }));
-  app.use('/api/public', createPublicRouter({ pool, limiter: publicLimiter, logger: vehicleLogger }));
+  app.use('/api/vehicles', createVehiclesRouter({ pool, origins, logger: activeLogger }));
+  app.use('/api/public', createPublicRouter({ pool, limiter: publicLimiter, logger: activeLogger }));
   app.get('/api/health', async (_req, res) => {
+    const safeLog = (level, message, meta) => {
+      try {
+        if (typeof activeLogger?.[level] === 'function') {
+          activeLogger[level](message, meta);
+        }
+      } catch {}
+    };
+
     try {
       await pool.query('SELECT 1');
       return res.json({ status: 'ok', uptime: process.uptime() });
-    } catch {
+    } catch (firstErr) {
+      const firstCode = sanitizeDbErrorCode(firstErr?.code);
+      const isStale =
+        firstCode === 'PROTOCOL_CONNECTION_LOST' ||
+        firstCode === 'ECONNRESET' ||
+        firstCode === 'EPIPE';
+
+      if (isStale) {
+        safeLog('warn', 'Health check connection reset, retrying on fresh connection:', {
+          code: firstCode,
+        });
+        try {
+          await pool.query('SELECT 1');
+          return res.json({ status: 'ok', uptime: process.uptime() });
+        } catch (retryErr) {
+          const retryCode = sanitizeDbErrorCode(retryErr?.code);
+          safeLog('error', 'Health check database query failed on retry:', {
+            code: retryCode,
+          });
+          return res.status(503).json({ status: 'db_error', uptime: process.uptime() });
+        }
+      }
+
+      safeLog('error', 'Health check database query failed:', {
+        code: firstCode,
+      });
       return res.status(503).json({ status: 'db_error', uptime: process.uptime() });
     }
   });
@@ -159,14 +209,79 @@ export function createApp({
   return app;
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  try {
-    validateRuntimeConfig(process.env);
-    const app = createApp();
-    const port = Number(process.env.PORT) || 5001;
-    app.listen(port, () => console.log(`PARKX server listening on port ${port} (${process.env.NODE_ENV || 'development'})`));
-  } catch (error) {
-    console.error(error.message);
-    process.exitCode = 1;
+export {
+  verifyDatabaseReadiness,
+  sanitizeDbErrorCode,
+  createPoolConfig,
+  DEFAULT_DB_CONNECTION_LIMIT,
+  MAX_DB_CONNECTION_LIMIT,
+  parseConnectionLimit,
+  parseDbSsl,
+};
+
+export function resolveServerListenOptions({
+  env = process.env,
+  port,
+  host = '0.0.0.0',
+} = {}) {
+  let finalPort;
+  if (port !== undefined) {
+    const p = Number(port);
+    finalPort = Number.isInteger(p) && p >= 0 ? p : 5001;
+  } else {
+    const rawEnv = typeof env.PORT === 'string' ? env.PORT.trim() : env.PORT;
+    const p = rawEnv !== undefined && rawEnv !== '' ? Number(rawEnv) : NaN;
+    finalPort = Number.isInteger(p) && p >= 0 ? p : 5001;
   }
+  const finalHost = typeof host === 'string' && host.trim() !== '' ? host.trim() : '0.0.0.0';
+  return { port: finalPort, host: finalHost };
+}
+
+export async function startServer({
+  env = process.env,
+  pool,
+  store,
+  port,
+  host = '0.0.0.0',
+  timeoutMs = Number(env.DB_READINESS_TIMEOUT_MS) || 5000,
+  logger = console,
+} = {}) {
+  validateRuntimeConfig(env);
+  const targetPool = pool || getPool();
+
+  try {
+    await verifyDatabaseReadiness(targetPool, { timeoutMs });
+  } catch (err) {
+    const safeCode = sanitizeDbErrorCode(err.code);
+    logger.error(`Database readiness check failed: unable to connect to database (${safeCode}). Server startup aborted.`);
+    const error = new Error(`Database readiness check failed: ${safeCode}`);
+    error.code = safeCode;
+    throw error;
+  }
+
+  const app = createApp({ env, pool: targetPool, store });
+  const { port: finalPort, host: finalHost } = resolveServerListenOptions({ env, port, host });
+
+  return new Promise((resolve, reject) => {
+    const server = app.listen(finalPort, finalHost, () => {
+      const actualPort = server.address()?.port ?? finalPort;
+      logger.log(`PARKX server listening on ${finalHost}:${actualPort} (${env.NODE_ENV || 'development'})`);
+      resolve(server);
+    });
+    server.on('error', (err) => {
+      reject(err);
+    });
+  });
+}
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  startServer().catch((error) => {
+    if (error.code === 'INVALID_CONFIGURATION') {
+      console.error(error.message);
+    } else if (!error.message?.includes('Database readiness check failed')) {
+      const safeCode = sanitizeDbErrorCode(error.code);
+      console.error(`Server startup failed: ${safeCode}`);
+    }
+    process.exit(1);
+  });
 }
