@@ -1,4 +1,4 @@
-import 'dotenv/config';
+import fs from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -46,6 +46,7 @@ export async function applyMigrations(pool, migrationDirectory = directory) {
           await verifyVehicleQrIntegritySchema(connection, { allowLegacyActiveRows: !applied.has('006_vehicle_qr_check_integrity.sql') });
         }
         if (file === '006_vehicle_qr_check_integrity.sql') await verifyStrictQrActiveConstraint(connection);
+        if (file === '007_visitor_sessions.sql') await verifyVisitorSessionsSchema(connection);
         continue;
       }
       if (file.startsWith('003_')) await assertNoNormalizedEmailDuplicates(connection);
@@ -53,6 +54,17 @@ export async function applyMigrations(pool, migrationDirectory = directory) {
         await applyVehicleQrIntegrityMigration(connection);
       } else if (file === '006_vehicle_qr_check_integrity.sql') {
         await applyQrActiveCheckConstraintMigration(connection);
+      } else if (file === '007_visitor_sessions.sql') {
+        const exists = await tableExists(connection, 'visitor_sessions');
+        if (exists) {
+          await verifyVisitorSessionsSchema(connection);
+        } else {
+          const sql = (await readFile(path.join(migrationDirectory, file), 'utf8')).replace(/^\s*--.*$/gm, '');
+          for (const statement of sql.split(';').map((part) => part.trim()).filter(Boolean)) {
+            await connection.query(statement);
+          }
+          await verifyVisitorSessionsSchema(connection);
+        }
       } else {
         const sql = (await readFile(path.join(migrationDirectory, file), 'utf8')).replace(/^\s*--.*$/gm, '');
         for (const statement of sql.split(';').map((part) => part.trim()).filter(Boolean)) {
@@ -396,6 +408,382 @@ export async function applyVehicleQrIntegrityMigration(connection) {
   await ensureQrActiveConstraint(connection);
 }
 
+export function migration007Error(message) {
+  return new Error(`Migration 007 schema inconsistency: ${message}`);
+}
+
+export async function verifyVisitorSessionsSchema(connection) {
+  // 1. Table existence & engine & collation
+  const [tableRows] = await connection.query(
+    'SELECT TABLE_NAME, ENGINE, TABLE_COLLATION FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?',
+    ['visitor_sessions']
+  );
+  if (!tableRows.length) {
+    throw migration007Error('required table visitor_sessions is missing.');
+  }
+  if ((tableRows[0].ENGINE || '').toLowerCase() !== 'innodb') {
+    throw migration007Error(`visitor_sessions table engine must be InnoDB, found ${tableRows[0].ENGINE}.`);
+  }
+  if ((tableRows[0].TABLE_COLLATION || '').toLowerCase() !== 'utf8mb4_unicode_ci') {
+    throw migration007Error(`visitor_sessions table collation must be utf8mb4_unicode_ci, found ${tableRows[0].TABLE_COLLATION}.`);
+  }
+
+  // 2. Required columns and types
+  const [cols] = await connection.query(
+    `SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA,
+            CHARACTER_SET_NAME, COLLATION_NAME, GENERATION_EXPRESSION
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+     ORDER BY ORDINAL_POSITION`,
+    ['visitor_sessions']
+  );
+
+  if (cols.length !== 9) {
+    throw migration007Error(`visitor_sessions table must contain exactly 9 columns, found ${cols.length}.`);
+  }
+
+  // Reject generated or invisible columns across the table
+  for (const c of cols) {
+    if (c.GENERATION_EXPRESSION) {
+      throw migration007Error(`column ${c.COLUMN_NAME} on visitor_sessions must not be a generated column.`);
+    }
+    if (/\binvisible\b/i.test(c.EXTRA || '')) {
+      throw migration007Error(`column ${c.COLUMN_NAME} on visitor_sessions must not be an invisible column.`);
+    }
+    if (/\b(?:virtual|stored)\b/i.test(c.EXTRA || '')) {
+      throw migration007Error(`column ${c.COLUMN_NAME} on visitor_sessions must not be a generated column.`);
+    }
+    if (c.COLUMN_NAME !== 'id' && /\bauto_increment\b/i.test(c.EXTRA || '')) {
+      throw migration007Error(`column ${c.COLUMN_NAME} on visitor_sessions must not be auto_increment.`);
+    }
+  }
+
+  const colMap = new Map(cols.map((c) => [c.COLUMN_NAME, c]));
+
+  // id: strictly BIGINT UNSIGNED, not null, auto_increment, no default
+  const idCol = colMap.get('id');
+  if (
+    !idCol ||
+    idCol.COLUMN_TYPE !== 'bigint unsigned' ||
+    idCol.IS_NULLABLE !== 'NO' ||
+    !idCol.EXTRA.includes('auto_increment') ||
+    idCol.COLUMN_DEFAULT !== null
+  ) {
+    throw migration007Error('invalid id column definition on visitor_sessions: must be BIGINT UNSIGNED AUTO_INCREMENT.');
+  }
+
+  // public_id: strictly VARCHAR(64), not null, utf8mb4_unicode_ci, no default, no on update
+  const publicIdCol = colMap.get('public_id');
+  if (
+    !publicIdCol ||
+    publicIdCol.COLUMN_TYPE !== 'varchar(64)' ||
+    publicIdCol.IS_NULLABLE !== 'NO' ||
+    publicIdCol.COLUMN_DEFAULT !== null ||
+    publicIdCol.EXTRA.includes('auto_increment') ||
+    /\bon update\b/i.test(publicIdCol.EXTRA || '') ||
+    (publicIdCol.CHARACTER_SET_NAME && publicIdCol.CHARACTER_SET_NAME !== 'utf8mb4') ||
+    (publicIdCol.COLLATION_NAME && publicIdCol.COLLATION_NAME !== 'utf8mb4_unicode_ci')
+  ) {
+    throw migration007Error('invalid public_id column definition on visitor_sessions: must be VARCHAR(64) NOT NULL.');
+  }
+
+  // vehicle_id: strictly INT UNSIGNED, not null, no default, no on update
+  const vehicleIdCol = colMap.get('vehicle_id');
+  if (
+    !vehicleIdCol ||
+    vehicleIdCol.COLUMN_TYPE !== 'int unsigned' ||
+    vehicleIdCol.IS_NULLABLE !== 'NO' ||
+    vehicleIdCol.COLUMN_DEFAULT !== null ||
+    vehicleIdCol.EXTRA.includes('auto_increment') ||
+    /\bon update\b/i.test(vehicleIdCol.EXTRA || '')
+  ) {
+    throw migration007Error('invalid vehicle_id column definition on visitor_sessions: must be INT UNSIGNED NOT NULL.');
+  }
+
+  // credential_hash: strictly VARCHAR(64), not null, utf8mb4_unicode_ci, no default, no on update
+  const credCol = colMap.get('credential_hash');
+  if (
+    !credCol ||
+    credCol.COLUMN_TYPE !== 'varchar(64)' ||
+    credCol.IS_NULLABLE !== 'NO' ||
+    credCol.COLUMN_DEFAULT !== null ||
+    credCol.EXTRA.includes('auto_increment') ||
+    /\bon update\b/i.test(credCol.EXTRA || '') ||
+    (credCol.CHARACTER_SET_NAME && credCol.CHARACTER_SET_NAME !== 'utf8mb4') ||
+    (credCol.COLLATION_NAME && credCol.COLLATION_NAME !== 'utf8mb4_unicode_ci')
+  ) {
+    throw migration007Error('invalid credential_hash column definition on visitor_sessions: must be VARCHAR(64) NOT NULL.');
+  }
+
+  // status: strictly ENUM('pending','accepted','closed','expired') NOT NULL DEFAULT 'pending' with utf8mb4_unicode_ci collation
+  const statusCol = colMap.get('status');
+  const exactStatusEnum = "enum('pending','accepted','closed','expired')";
+  if (
+    !statusCol ||
+    statusCol.COLUMN_TYPE !== exactStatusEnum ||
+    statusCol.IS_NULLABLE !== 'NO' ||
+    statusCol.COLUMN_DEFAULT !== 'pending' ||
+    /\bon update\b/i.test(statusCol.EXTRA || '') ||
+    (statusCol.CHARACTER_SET_NAME && statusCol.CHARACTER_SET_NAME !== 'utf8mb4') ||
+    (statusCol.COLLATION_NAME && statusCol.COLLATION_NAME !== 'utf8mb4_unicode_ci')
+  ) {
+    throw migration007Error("invalid status column definition on visitor_sessions: must be ENUM('pending','accepted','closed','expired') NOT NULL DEFAULT 'pending' with utf8mb4_unicode_ci collation.");
+  }
+
+  // created_at: strictly TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP without ON UPDATE
+  const createdCol = colMap.get('created_at');
+  if (
+    !createdCol ||
+    createdCol.COLUMN_TYPE !== 'timestamp' ||
+    createdCol.IS_NULLABLE !== 'NO' ||
+    String(createdCol.COLUMN_DEFAULT ?? '').trim().toLowerCase() !== 'current_timestamp' ||
+    /\bon update\b/i.test(createdCol.EXTRA || '')
+  ) {
+    throw migration007Error('invalid created_at column definition on visitor_sessions: must be TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP without ON UPDATE.');
+  }
+
+  // expires_at: strictly TIMESTAMP NOT NULL without a default and without ON UPDATE
+  const expiresCol = colMap.get('expires_at');
+  if (
+    !expiresCol ||
+    expiresCol.COLUMN_TYPE !== 'timestamp' ||
+    expiresCol.IS_NULLABLE !== 'NO' ||
+    expiresCol.COLUMN_DEFAULT !== null ||
+    /\bon update\b/i.test(expiresCol.EXTRA || '')
+  ) {
+    throw migration007Error('invalid expires_at column definition on visitor_sessions: must be TIMESTAMP NOT NULL without a default or ON UPDATE clause.');
+  }
+
+  // accepted_at: strictly TIMESTAMP NULL DEFAULT NULL without an unexpected default and without ON UPDATE
+  const acceptedCol = colMap.get('accepted_at');
+  if (
+    !acceptedCol ||
+    acceptedCol.COLUMN_TYPE !== 'timestamp' ||
+    acceptedCol.IS_NULLABLE !== 'YES' ||
+    acceptedCol.COLUMN_DEFAULT !== null ||
+    /\bon update\b/i.test(acceptedCol.EXTRA || '')
+  ) {
+    throw migration007Error('invalid accepted_at column definition on visitor_sessions: must be TIMESTAMP NULL DEFAULT NULL without an unexpected default or ON UPDATE clause.');
+  }
+
+  // closed_at: strictly TIMESTAMP NULL DEFAULT NULL without an unexpected default and without ON UPDATE
+  const closedCol = colMap.get('closed_at');
+  if (
+    !closedCol ||
+    closedCol.COLUMN_TYPE !== 'timestamp' ||
+    closedCol.IS_NULLABLE !== 'YES' ||
+    closedCol.COLUMN_DEFAULT !== null ||
+    /\bon update\b/i.test(closedCol.EXTRA || '')
+  ) {
+    throw migration007Error('invalid closed_at column definition on visitor_sessions: must be TIMESTAMP NULL DEFAULT NULL without an unexpected default or ON UPDATE clause.');
+  }
+
+  // Exact DDL inspection using SHOW CREATE TABLE for EVERY column
+  const [createTableRows] = await connection.query('SHOW CREATE TABLE visitor_sessions');
+  const createTableSql = createTableRows[0]?.['Create Table'] || '';
+
+  const extractColDdl = (colName) => {
+    const match = createTableSql.match(new RegExp(`^\\s*[\`"]?${colName}[\`"]?\\s+(.*?),?$`, 'm'));
+    return match ? match[1].trim() : null;
+  };
+
+  const idDdl = extractColDdl('id');
+  if (!idDdl || !/^bigint\s+unsigned\s+NOT\s+NULL\s+AUTO_INCREMENT$/i.test(idDdl) || /\bdefault\b/i.test(idDdl) || /\bon\s+update\b/i.test(idDdl) || /\binvisible\b/i.test(idDdl)) {
+    throw migration007Error('invalid id column definition on visitor_sessions: must be BIGINT UNSIGNED NOT NULL AUTO_INCREMENT without defaults in DDL.');
+  }
+
+  const publicIdDdl = extractColDdl('public_id');
+  if (!publicIdDdl || !/^varchar\(64\)(?:\s+CHARACTER\s+SET\s+utf8mb4)?(?:\s+COLLATE\s+utf8mb4_unicode_ci)?\s+NOT\s+NULL$/i.test(publicIdDdl) || /\bdefault\b/i.test(publicIdDdl) || /\bon\s+update\b/i.test(publicIdDdl) || /\binvisible\b/i.test(publicIdDdl)) {
+    throw migration007Error('invalid public_id column definition on visitor_sessions: must be VARCHAR(64) NOT NULL without defaults in DDL.');
+  }
+
+  const vehicleIdDdl = extractColDdl('vehicle_id');
+  if (!vehicleIdDdl || !/^int\s+unsigned\s+NOT\s+NULL$/i.test(vehicleIdDdl) || /\bdefault\b/i.test(vehicleIdDdl) || /\bon\s+update\b/i.test(vehicleIdDdl) || /\binvisible\b/i.test(vehicleIdDdl)) {
+    throw migration007Error('invalid vehicle_id column definition on visitor_sessions: must be INT UNSIGNED NOT NULL without defaults in DDL.');
+  }
+
+  const credDdl = extractColDdl('credential_hash');
+  if (!credDdl || !/^varchar\(64\)(?:\s+CHARACTER\s+SET\s+utf8mb4)?(?:\s+COLLATE\s+utf8mb4_unicode_ci)?\s+NOT\s+NULL$/i.test(credDdl) || /\bdefault\b/i.test(credDdl) || /\bon\s+update\b/i.test(credDdl) || /\binvisible\b/i.test(credDdl)) {
+    throw migration007Error('invalid credential_hash column definition on visitor_sessions: must be VARCHAR(64) NOT NULL without defaults in DDL.');
+  }
+
+  const statusDdl = extractColDdl('status');
+  if (!statusDdl || !/^enum\('pending','accepted','closed','expired'\)(?:\s+CHARACTER\s+SET\s+utf8mb4)?(?:\s+COLLATE\s+utf8mb4_unicode_ci)?\s+NOT\s+NULL\s+DEFAULT\s+'pending'$/i.test(statusDdl) || /\bon\s+update\b/i.test(statusDdl) || /\binvisible\b/i.test(statusDdl)) {
+    throw migration007Error("invalid status column definition on visitor_sessions: must be ENUM('pending','accepted','closed','expired') NOT NULL DEFAULT 'pending' in DDL.");
+  }
+
+  const createdDdl = extractColDdl('created_at');
+  if (!createdDdl || !/^timestamp\s+NOT\s+NULL\s+DEFAULT\s+CURRENT_TIMESTAMP$/i.test(createdDdl) || /\bon\s+update\b/i.test(createdDdl) || /\binvisible\b/i.test(createdDdl)) {
+    throw migration007Error('invalid created_at column definition on visitor_sessions: must be TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP without ON UPDATE in DDL.');
+  }
+
+  const expiresDdl = extractColDdl('expires_at');
+  if (!expiresDdl || !/^timestamp\s+NOT\s+NULL$/i.test(expiresDdl) || /\bdefault\b/i.test(expiresDdl) || /\bon\s+update\b/i.test(expiresDdl) || /\binvisible\b/i.test(expiresDdl)) {
+    throw migration007Error('invalid expires_at column definition on visitor_sessions: must be TIMESTAMP NOT NULL without a default or ON UPDATE clause in DDL.');
+  }
+
+  const acceptedDdl = extractColDdl('accepted_at');
+  if (!acceptedDdl || !/^timestamp\s+NULL\s+DEFAULT\s+NULL$/i.test(acceptedDdl) || /\bon\s+update\b/i.test(acceptedDdl) || /\binvisible\b/i.test(acceptedDdl)) {
+    throw migration007Error('invalid accepted_at column definition on visitor_sessions: must explicitly specify DEFAULT NULL in DDL without an unexpected default or ON UPDATE clause.');
+  }
+
+  const closedDdl = extractColDdl('closed_at');
+  if (!closedDdl || !/^timestamp\s+NULL\s+DEFAULT\s+NULL$/i.test(closedDdl) || /\bon\s+update\b/i.test(closedDdl) || /\binvisible\b/i.test(closedDdl)) {
+    throw migration007Error('invalid closed_at column definition on visitor_sessions: must explicitly specify DEFAULT NULL in DDL without an unexpected default or ON UPDATE clause.');
+  }
+
+  // 3. Exact Index Set & Direction Verification
+  const [indexes] = await connection.query(
+    `SELECT INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME, SUB_PART, INDEX_TYPE, IS_VISIBLE, COLLATION
+     FROM information_schema.STATISTICS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'visitor_sessions'
+     ORDER BY INDEX_NAME, SEQ_IN_INDEX`
+  );
+
+  const indexGroups = new Map();
+  for (const idx of indexes) {
+    if (!indexGroups.has(idx.INDEX_NAME)) indexGroups.set(idx.INDEX_NAME, []);
+    indexGroups.get(idx.INDEX_NAME).push(idx);
+  }
+
+  // The complete expected index set according to migration 007
+  const expectedIndexes = new Map([
+    [
+      'PRIMARY',
+      {
+        unique: true,
+        columns: ['id'],
+      },
+    ],
+    [
+      'uq_visitor_sessions_public_id',
+      {
+        unique: true,
+        columns: ['public_id'],
+      },
+    ],
+    [
+      'idx_visitor_sessions_vehicle_status',
+      {
+        unique: false,
+        columns: ['vehicle_id', 'status', 'created_at'],
+      },
+    ],
+    [
+      'idx_visitor_sessions_credential_hash',
+      {
+        unique: false,
+        columns: ['credential_hash'],
+      },
+    ],
+    [
+      'idx_visitor_sessions_expires_status',
+      {
+        unique: false,
+        columns: ['expires_at', 'status'],
+      },
+    ],
+    [
+      'idx_visitor_sessions_closed_status',
+      {
+        unique: false,
+        columns: ['closed_at', 'status'],
+      },
+    ],
+  ]);
+
+  // Reject unexpected extra indexes
+  for (const actualName of indexGroups.keys()) {
+    if (!expectedIndexes.has(actualName)) {
+      throw migration007Error(`unexpected extra index ${actualName} found on visitor_sessions.`);
+    }
+  }
+
+  // Ensure every expected index exists
+  for (const expectedName of expectedIndexes.keys()) {
+    if (!indexGroups.has(expectedName)) {
+      throw migration007Error(`missing required index ${expectedName} on visitor_sessions.`);
+    }
+  }
+
+  if (indexGroups.size !== expectedIndexes.size) {
+    throw migration007Error(`visitor_sessions must have exactly ${expectedIndexes.size} indexes, found ${indexGroups.size}.`);
+  }
+
+  // Verify each index's uniqueness, ordered columns, prefix length, visibility, and BTREE type
+  for (const [name, expected] of expectedIndexes.entries()) {
+    const actualCols = indexGroups.get(name);
+    if (!actualCols || actualCols.length !== expected.columns.length) {
+      throw migration007Error(`index ${name} on visitor_sessions has incorrect column count: expected ${expected.columns.length}, found ${actualCols?.length}.`);
+    }
+    const isUnique = Number(actualCols[0].NON_UNIQUE) === 0;
+    if (isUnique !== expected.unique) {
+      throw migration007Error(`index ${name} on visitor_sessions has incorrect uniqueness: expected unique=${expected.unique}.`);
+    }
+    for (let i = 0; i < expected.columns.length; i++) {
+      const col = actualCols[i];
+      if (col.COLUMN_NAME !== expected.columns[i]) {
+        throw migration007Error(`index ${name} column at position ${i + 1} must be ${expected.columns[i]}, found ${col.COLUMN_NAME}.`);
+      }
+      if (Number(col.SEQ_IN_INDEX) !== i + 1) {
+        throw migration007Error(`index ${name} column ${expected.columns[i]} has incorrect sequence position.`);
+      }
+      if (col.SUB_PART !== null && col.SUB_PART !== undefined) {
+        throw migration007Error(`index ${name} must be a full-column index; prefix index (sub_part=${col.SUB_PART}) is rejected.`);
+      }
+      if (String(col.IS_VISIBLE).toUpperCase() !== 'YES') {
+        throw migration007Error(`index ${name} on visitor_sessions is invisible; all migration 007 indexes must be visible.`);
+      }
+      if (String(col.INDEX_TYPE).toUpperCase() !== 'BTREE') {
+        throw migration007Error(`index ${name} on visitor_sessions must have INDEX_TYPE BTREE.`);
+      }
+      if (col.COLLATION !== 'A') {
+        throw migration007Error(`index ${name} column ${expected.columns[i]} must have ascending direction ('A'), found '${col.COLLATION}'.`);
+      }
+    }
+  }
+
+  // 5. Foreign key on vehicle_id -> vehicles(id) ON DELETE CASCADE
+  const [schemaRows] = await connection.query('SELECT DATABASE() AS schemaName');
+  const currentSchema = schemaRows[0]?.schemaName;
+  const [fks] = await connection.query(
+    `SELECT tc.CONSTRAINT_NAME, kcu.COLUMN_NAME, kcu.ORDINAL_POSITION,
+            kcu.REFERENCED_TABLE_SCHEMA, kcu.REFERENCED_TABLE_NAME,
+            kcu.REFERENCED_COLUMN_NAME, rc.DELETE_RULE, rc.UPDATE_RULE
+     FROM information_schema.TABLE_CONSTRAINTS tc
+     JOIN information_schema.KEY_COLUMN_USAGE kcu
+       ON kcu.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
+      AND kcu.TABLE_NAME = tc.TABLE_NAME
+      AND kcu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+     JOIN information_schema.REFERENTIAL_CONSTRAINTS rc
+       ON rc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
+      AND rc.TABLE_NAME = tc.TABLE_NAME
+      AND rc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+    WHERE tc.CONSTRAINT_SCHEMA = DATABASE()
+      AND tc.TABLE_NAME = 'visitor_sessions'
+      AND tc.CONSTRAINT_TYPE = 'FOREIGN KEY'`
+  );
+
+  const fkGroups = new Map();
+  for (const fk of fks) {
+    if (!fkGroups.has(fk.CONSTRAINT_NAME)) fkGroups.set(fk.CONSTRAINT_NAME, []);
+    fkGroups.get(fk.CONSTRAINT_NAME).push(fk);
+  }
+  const validFk = fkGroups.size === 1 ? [...fkGroups.values()][0] : null;
+  if (
+    !validFk || validFk.length !== 1 ||
+    validFk[0].CONSTRAINT_NAME !== 'fk_visitor_sessions_vehicle_id' ||
+    validFk[0].COLUMN_NAME !== 'vehicle_id' || Number(validFk[0].ORDINAL_POSITION) !== 1 ||
+    validFk[0].REFERENCED_TABLE_SCHEMA !== currentSchema ||
+    validFk[0].REFERENCED_TABLE_NAME !== 'vehicles' ||
+    validFk[0].REFERENCED_COLUMN_NAME !== 'id' ||
+    validFk[0].DELETE_RULE !== 'CASCADE' ||
+    !['NO ACTION', 'RESTRICT'].includes(validFk[0].UPDATE_RULE)
+  ) {
+    throw migration007Error('foreign key must be named fk_visitor_sessions_vehicle_id and reference vehicle_id to vehicles(id) with ON DELETE CASCADE.');
+  }
+}
+
 export async function runMigrations(env = process.env) {
   if (env.NODE_ENV === 'production' && (!env.MIGRATION_DB_USER || !env.MIGRATION_DB_PASSWORD)) {
     throw new Error('Production migrations require MIGRATION_DB_USER and MIGRATION_DB_PASSWORD.');
@@ -417,7 +805,50 @@ export async function runMigrations(env = process.env) {
   }
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+export function resolveMigrationEnvPath(metaUrl = import.meta.url) {
+  return fileURLToPath(new URL('../.env', metaUrl));
+}
+
+export function loadMigrationEnv({ metaUrl = import.meta.url, dotenvModule } = {}) {
+  try {
+    const envPath = resolveMigrationEnvPath(metaUrl);
+    if (dotenvModule && typeof dotenvModule.config === 'function') {
+      dotenvModule.config({ path: envPath, override: false });
+    }
+  } catch {}
+}
+
+function isDirectExecution() {
+  if (!process.argv[1]) return false;
+  try {
+    const current = fileURLToPath(import.meta.url);
+    const entry = path.resolve(process.argv[1]);
+    if (current === entry) return true;
+    return fs.existsSync(entry) && fs.realpathSync(current) === fs.realpathSync(entry);
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectExecution()) {
+  try {
+    const dotenv = await import('dotenv');
+    loadMigrationEnv({ dotenvModule: dotenv });
+  } catch {}
+
+  // Safe CLI inspect mode: allows testing environment resolution without database execution or secret leakage
+  if (process.argv.includes('--inspect-env') || process.argv.includes('--dry-run')) {
+    const sentinelKey = process.env.MIGRATION_SENTINEL_KEY || 'MIGRATION_ENV_SENTINEL';
+    const sentinelLoaded = typeof process.env[sentinelKey] === 'string' && process.env[sentinelKey].length > 0;
+    process.stdout.write(JSON.stringify({
+      sentinelLoaded,
+      sentinelKey,
+      hasTestInspectVar: typeof process.env.TEST_INSPECT_VAR === 'string',
+      testInspectVarMatches: process.env.TEST_INSPECT_VAR === 'precedence_value_from_process',
+    }));
+    process.exit(0);
+  }
+
   runMigrations().catch((error) => {
     console.error('Migration failed:', error.code || error.message);
     process.exitCode = 1;

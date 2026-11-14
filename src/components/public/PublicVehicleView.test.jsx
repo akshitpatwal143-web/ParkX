@@ -5,6 +5,12 @@ import { cleanup, render, screen, waitFor, act } from '@testing-library/react';
 
 vi.mock('../../services/publicService', () => ({
   verifyPublicToken: vi.fn(),
+  getStoredVisitorSession: vi.fn(() => null),
+  saveStoredVisitorSession: vi.fn(),
+  clearStoredVisitorSession: vi.fn(),
+  createVisitorSession: vi.fn(),
+  getVisitorSession: vi.fn(),
+  closeVisitorSession: vi.fn(),
 }));
 
 import { verifyPublicToken } from '../../services/publicService';

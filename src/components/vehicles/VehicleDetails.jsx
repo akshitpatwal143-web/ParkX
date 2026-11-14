@@ -17,12 +17,26 @@ import {
   Palette,
   Hash,
   Sparkles,
+  MessageSquare,
+  Clock,
+  CheckCircle,
+  XCircle,
 } from 'lucide-react';
-import { updateVehicle, deleteVehicle, rotateQrCode, fetchVehicle } from '../../services/vehicleService';
+import {
+  updateVehicle,
+  deleteVehicle,
+  rotateQrCode,
+  fetchVehicle,
+  fetchVehicleSessions,
+  acceptVisitorSession,
+  closeOwnerVisitorSession,
+} from '../../services/vehicleService';
 
 export default function VehicleDetails({ vehicleId, onBack, onVehicleDeleted, onVehicleUpdated, initialQrToken, onInitialQrTokenConsumed }) {
   const [vehicle, setVehicle] = useState(null);
   const [qrHistory, setQrHistory] = useState([]);
+  const [sessions, setSessions] = useState([]);
+  const [actionLoadingId, setActionLoadingId] = useState(null);
   const [qrDataUrl, setQrDataUrl] = useState('');
   const [qrUnavailable, setQrUnavailable] = useState(!initialQrToken);
   const [loading, setLoading] = useState(true);
@@ -61,10 +75,46 @@ export default function VehicleDetails({ vehicleId, onBack, onVehicleDeleted, on
         color: data.vehicle.color || '',
       });
 
+      // Load visitor sessions
+      fetchVehicleSessions(vehicleId)
+        .then((sData) => setSessions(sData.sessions || []))
+        .catch(() => {});
     } catch (err) {
       setError(err.message || 'Failed to load vehicle details');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleAcceptSession = async (sessionId) => {
+    setActionLoadingId(sessionId);
+    try {
+      const res = await acceptVisitorSession(sessionId);
+      if (res.status === 'accepted') {
+        setSessions((prev) =>
+          prev.map((s) => (s.sessionId === sessionId ? { ...s, status: 'accepted', acceptedAt: res.acceptedAt } : s))
+        );
+      }
+    } catch (err) {
+      setError(err.message || 'Failed to accept visitor session');
+    } finally {
+      setActionLoadingId(null);
+    }
+  };
+
+  const handleCloseOwnerSession = async (sessionId) => {
+    setActionLoadingId(sessionId);
+    try {
+      const res = await closeOwnerVisitorSession(sessionId);
+      if (res.status === 'closed') {
+        setSessions((prev) =>
+          prev.map((s) => (s.sessionId === sessionId ? { ...s, status: 'closed', closedAt: res.closedAt } : s))
+        );
+      }
+    } catch (err) {
+      setError(err.message || 'Failed to close visitor session');
+    } finally {
+      setActionLoadingId(null);
     }
   };
 
@@ -404,6 +454,101 @@ export default function VehicleDetails({ vehicleId, onBack, onVehicleDeleted, on
               </div>
             </div>
           )}
+
+          {/* Incoming Visitor Contact Sessions (Phase 3.2) */}
+          <div className="p-6 rounded-xl bg-[#0f0f0f] border border-white/[0.08] space-y-4">
+            <h3 className="text-xs font-mono tracking-widest uppercase text-neutral-300 flex items-center justify-between">
+              <span className="flex items-center space-x-2">
+                <MessageSquare className="w-3.5 h-3.5 text-[#2ee6ca]" />
+                <span>Incoming Contact Requests</span>
+              </span>
+              <span className="text-[10px] text-neutral-500">{sessions.length} Session(s)</span>
+            </h3>
+
+            {sessions.length === 0 ? (
+              <p className="text-xs font-mono text-neutral-500 py-2">
+                No visitor contact requests received yet for this vehicle.
+              </p>
+            ) : (
+              <div className="space-y-3">
+                {sessions.map((s) => (
+                  <div
+                    key={s.sessionId}
+                    className="p-3.5 rounded-lg bg-[#141414] border border-white/[0.04] space-y-2 text-xs font-mono"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center space-x-2">
+                        <span
+                          className={`w-2 h-2 rounded-full ${
+                            s.status === 'pending'
+                              ? 'bg-amber-400 animate-pulse'
+                              : s.status === 'accepted'
+                              ? 'bg-[#2ee6ca]'
+                              : 'bg-neutral-600'
+                          }`}
+                        />
+                        <span className="text-white font-medium">
+                          Ref: {s.sessionId.slice(0, 14)}...
+                        </span>
+                      </div>
+
+                      <span
+                        className={`uppercase tracking-wider px-2 py-0.5 rounded text-[10px] ${
+                          s.status === 'pending'
+                            ? 'bg-amber-400/10 text-amber-400 border border-amber-400/30'
+                            : s.status === 'accepted'
+                            ? 'bg-[#2ee6ca]/10 text-[#2ee6ca] border border-[#2ee6ca]/30'
+                            : 'bg-neutral-800 text-neutral-400'
+                        }`}
+                      >
+                        {s.status}
+                      </span>
+                    </div>
+
+                    <div className="flex items-center justify-between text-[11px] text-neutral-400">
+                      <span>Created: {new Date(s.createdAt).toLocaleTimeString()}</span>
+                      {s.expiresAt && (
+                        <span>Expires: {new Date(s.expiresAt).toLocaleTimeString()}</span>
+                      )}
+                    </div>
+
+                    {/* Action buttons for owner */}
+                    <div className="flex items-center space-x-2 pt-1">
+                      {s.status === 'pending' && (
+                        <button
+                          onClick={() => handleAcceptSession(s.sessionId)}
+                          disabled={actionLoadingId === s.sessionId}
+                          className="flex-1 inline-flex items-center justify-center space-x-1.5 py-1.5 rounded bg-[#2ee6ca] hover:bg-[#28d1b7] text-black font-semibold uppercase text-[10px] tracking-wider transition-colors disabled:opacity-50"
+                        >
+                          {actionLoadingId === s.sessionId ? (
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                          ) : (
+                            <CheckCircle className="w-3 h-3" />
+                          )}
+                          <span>Accept Request</span>
+                        </button>
+                      )}
+
+                      {(s.status === 'pending' || s.status === 'accepted') && (
+                        <button
+                          onClick={() => handleCloseOwnerSession(s.sessionId)}
+                          disabled={actionLoadingId === s.sessionId}
+                          className="inline-flex items-center justify-center space-x-1.5 px-3 py-1.5 rounded border border-red-500/20 bg-red-500/10 hover:bg-red-500/20 text-red-400 uppercase text-[10px] tracking-wider transition-colors disabled:opacity-50"
+                        >
+                          {actionLoadingId === s.sessionId ? (
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                          ) : (
+                            <XCircle className="w-3 h-3" />
+                          )}
+                          <span>Close</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
 
           {/* QR Code Audit History */}
           <div className="p-6 rounded-xl bg-[#0f0f0f] border border-white/[0.08] space-y-4">

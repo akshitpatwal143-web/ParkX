@@ -1,37 +1,123 @@
-import 'dotenv/config';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes, createHash } from 'node:crypto';
 import express from 'express';
 import session from 'express-session';
 import mysql from 'mysql2/promise';
-import { applyMigrations } from '../src/migrate.js';
+import { applyMigrations, verifyVisitorSessionsSchema } from '../src/migrate.js';
 import { createVehiclesRouter } from '../src/routes/vehicles.js';
 import { createPublicRouter } from '../src/routes/public.js';
+import { runVisitorSessionCleanup } from '../src/services/sessionCleanup.js';
 
 const enabled = process.env.RUN_MYSQL_INTEGRATION === '1';
-const config = {
-  host: process.env.DB_HOST || '127.0.0.1',
-  port: Number(process.env.DB_PORT) || 3306,
-  user: process.env.MIGRATION_DB_USER || process.env.DB_USER || 'root',
-  password: process.env.MIGRATION_DB_PASSWORD || process.env.DB_PASSWORD || '',
-};
+const TEST_ONLY_ACK = 'I_ACCEPT_DISPOSABLE_DATABASES';
+
+function normalizeHost(value) {
+  return String(value || '').trim().toLowerCase().replace(/\.$/, '');
+}
+
+export function resolveIntegrationDbConfig(env = process.env) {
+  if (env.NODE_ENV === 'production') {
+    throw new Error('MySQL integration tests are disabled when NODE_ENV=production.');
+  }
+  const required = ['TEST_DB_HOST', 'TEST_DB_USER', 'TEST_DB_PASSWORD'];
+  const missing = required.filter((key) => typeof env[key] !== 'string' || env[key].trim() === '');
+  if (missing.length) throw new Error(`MySQL integration tests require explicit test-only variables: ${missing.join(', ')}.`);
+  if (env.TEST_DB_ALLOW_CREATE_DROP !== TEST_ONLY_ACK) {
+    throw new Error('MySQL integration tests require TEST_DB_ALLOW_CREATE_DROP=I_ACCEPT_DISPOSABLE_DATABASES.');
+  }
+
+  const host = normalizeHost(env.TEST_DB_HOST);
+  if (/railway|rlwy\.net|\.railway\.app$/i.test(host)) {
+    throw new Error('MySQL integration tests reject known Railway database hosts.');
+  }
+  const productionHosts = [env.DB_HOST, env.MIGRATION_DB_HOST].map(normalizeHost).filter(Boolean);
+  if (productionHosts.includes(host)) {
+    throw new Error('TEST_DB_HOST must differ from configured application and migration database hosts.');
+  }
+  const productionUsers = [env.DB_USER, env.MIGRATION_DB_USER].filter(Boolean);
+  if (productionUsers.includes(env.TEST_DB_USER)) {
+    throw new Error('TEST_DB_USER must differ from configured application and migration users.');
+  }
+  const productionPasswords = [env.DB_PASSWORD, env.MIGRATION_DB_PASSWORD].filter(Boolean);
+  if (productionPasswords.includes(env.TEST_DB_PASSWORD)) {
+    throw new Error('TEST_DB_PASSWORD must differ from configured application and migration passwords.');
+  }
+  if (!/^parkx_test_[a-z0-9_]+$/i.test(env.TEST_DB_USER) || env.TEST_DB_USER.toLowerCase() === 'root') {
+    throw new Error('TEST_DB_USER must be a dedicated account named with the parkx_test_ prefix.');
+  }
+  const rawPort = env.TEST_DB_PORT === undefined ? '3306' : String(env.TEST_DB_PORT).trim();
+  if (!/^\d+$/.test(rawPort) || !Number.isSafeInteger(Number(rawPort)) || Number(rawPort) < 1 || Number(rawPort) > 65535) {
+    throw new Error('TEST_DB_PORT must be an integer from 1 to 65535.');
+  }
+  return { host, port: Number(rawPort), user: env.TEST_DB_USER, password: env.TEST_DB_PASSWORD };
+}
+
+const config = enabled ? resolveIntegrationDbConfig(process.env) : null;
 const origin = 'http://localhost:5173';
 
 function identifier() {
   return `parkx_it_${randomBytes(6).toString('hex')}`;
 }
 
+function assertDisposableDatabaseName(dbName, env = process.env) {
+  if (typeof dbName !== 'string' || !/^parkx_it_[a-f0-9]{12}$/.test(dbName)) {
+    throw new Error('Refusing database operation: identifier is outside the generated parkx_it_ namespace.');
+  }
+  const configuredDatabases = [env.DB_NAME, env.MIGRATION_DB_NAME, env.TEST_DB_NAME].filter(Boolean);
+  if (configuredDatabases.includes(dbName)) {
+    throw new Error('Refusing database operation: generated identifier matches a configured database name.');
+  }
+  return dbName;
+}
+
+test('MySQL integration configuration cannot inherit application credentials', () => {
+  assert.throws(() => resolveIntegrationDbConfig({ NODE_ENV: 'production' }), /disabled when NODE_ENV=production/);
+  assert.throws(() => resolveIntegrationDbConfig({ DB_HOST: 'app-db.example', DB_USER: 'app_user', DB_PASSWORD: 'app-secret' }), /explicit test-only variables/);
+  const base = {
+    TEST_DB_HOST: '127.0.0.1', TEST_DB_USER: 'parkx_test_local', TEST_DB_PASSWORD: 'separate-test-password',
+    TEST_DB_ALLOW_CREATE_DROP: TEST_ONLY_ACK,
+  };
+  assert.throws(() => resolveIntegrationDbConfig({ ...base, TEST_DB_HOST: 'containers-us-west-1.railway.app' }), /reject known Railway/);
+  assert.throws(() => resolveIntegrationDbConfig({ ...base, DB_HOST: '127.0.0.1' }), /must differ from configured application/);
+  assert.throws(() => resolveIntegrationDbConfig({ ...base, DB_PASSWORD: 'separate-test-password' }), /must differ from configured application/);
+  assert.deepEqual(resolveIntegrationDbConfig(base), {
+    host: '127.0.0.1', port: 3306, user: 'parkx_test_local', password: 'separate-test-password',
+  });
+  assert.throws(() => assertDisposableDatabaseName('parkx_production'), /outside the generated/);
+  assert.throws(() => assertDisposableDatabaseName('parkx_it_0123456789ab', { TEST_DB_NAME: 'parkx_it_0123456789ab' }), /matches a configured database/);
+});
+
 async function withDatabase(t, callback) {
   const admin = await mysql.createConnection(config);
-  const dbName = identifier();
-  assert.match(dbName, /^parkx_it_[a-f0-9]+$/);
-  await admin.query(`CREATE DATABASE \`${dbName}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
-  const pool = mysql.createPool({ ...config, database: dbName, connectionLimit: 12, charset: 'utf8mb4' });
+  const dbName = assertDisposableDatabaseName(identifier());
+  let pool;
+  let created = false;
+  try {
+    assertDisposableDatabaseName(dbName);
+    await admin.query(`CREATE DATABASE \`${dbName}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
+    created = true;
+    pool = mysql.createPool({ ...config, database: dbName, connectionLimit: 12, charset: 'utf8mb4' });
+  } catch (error) {
+    if (pool) await pool.end().catch(() => {});
+    if (created) {
+      assertDisposableDatabaseName(dbName);
+      await admin.query(`DROP DATABASE \`${dbName}\``).catch(() => {});
+    }
+    await admin.end().catch(() => {});
+    throw error;
+  }
   t.after(async () => {
-    await pool.end();
-    await admin.query(`DROP DATABASE \`${dbName}\``);
-    await admin.end();
+    try {
+      await pool.end();
+    } finally {
+      try {
+        assertDisposableDatabaseName(dbName);
+        await admin.query(`DROP DATABASE \`${dbName}\``);
+      } finally {
+        await admin.end();
+      }
+    }
   });
   return callback(pool, dbName);
 }
@@ -482,6 +568,735 @@ test('MySQL migration and vehicle integrity integration', { skip: !enabled }, as
       } finally {
         pool.query = originalQuery;
       }
+    });
+  });
+
+  await t.test('real MySQL concurrency: atomic 5-pending-session limit with SELECT ... FOR UPDATE', async (t) => {
+    await withDatabase(t, async (pool) => {
+      await migrate(pool);
+      const harness = await makeApp(pool);
+      t.after(() => harness.server.close());
+
+      // 1. Seed user & vehicle
+      const [uRes] = await pool.query("INSERT INTO users (full_name, email, password_hash) VALUES ('Limit User', 'limit-test@parkx.ai', 'hash')");
+      const userId = uRes.insertId;
+      const ownerCookie = await sessionFor(harness.base, userId);
+
+      const vRes = await request(harness.base, ownerCookie, 'POST', '', {
+        registration_number: 'LIMIT-5-TEST',
+        vehicle_type: 'ev',
+        vehicle_model: 'Lucid Air',
+        color: 'Zenith Red',
+      });
+      assert.equal(vRes.status, 201);
+      const vData = await vRes.json();
+      const qrToken = vData.vehicle.qrCode.token;
+      const vehicleId = vData.vehicle.id;
+
+      // 2. Concurrently fire 8 session creation requests against the same vehicle
+      const promises = Array.from({ length: 8 }).map(() =>
+        fetch(`${harness.base}/api/public/sessions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: qrToken }),
+        })
+      );
+
+      const responses = await Promise.all(promises);
+      const created = [];
+      const rateLimited = [];
+      for (const res of responses) {
+        const body = await res.json();
+        if (res.status === 201) created.push(body);
+        else if (res.status === 429) rateLimited.push(body);
+      }
+
+      // 3. Locking correctness verification:
+      // Exactly 5 sessions created; exactly 3 rejected with 429 rate_limited
+      assert.equal(created.length, 5, 'Exactly 5 sessions must be created in real MySQL');
+      assert.equal(rateLimited.length, 3, 'Remaining 3 requests must be serialized and rejected with 429');
+      for (const r of rateLimited) {
+        assert.equal(r.status, 'rate_limited');
+      }
+
+      // 4. Verify database state directly
+      const [dbRows] = await pool.query(
+        'SELECT COUNT(*) AS n FROM visitor_sessions WHERE vehicle_id = ? AND status = ?',
+        [vehicleId, 'pending']
+      );
+      assert.equal(Number(dbRows[0].n), 5);
+    });
+  });
+
+  await t.test('real MySQL race-safe state transitions: accept, close, and expiry boundaries', async (t) => {
+    await withDatabase(t, async (pool) => {
+      await migrate(pool);
+      const harness = await makeApp(pool);
+      t.after(() => harness.server.close());
+
+      const [uRes] = await pool.query("INSERT INTO users (full_name, email, password_hash) VALUES ('Transitions User', 'transitions-test@parkx.ai', 'hash')");
+      const userId = uRes.insertId;
+      const ownerCookie = await sessionFor(harness.base, userId);
+
+      const vRes = await request(harness.base, ownerCookie, 'POST', '', {
+        registration_number: 'TRANS-TEST-1',
+        vehicle_type: 'car',
+        vehicle_model: 'Audi e-tron GT',
+        color: 'Tactical Green',
+      });
+      const vData = await vRes.json();
+      const qrToken = vData.vehicle.qrCode.token;
+
+      // Create session
+      const createRes = await fetch(`${harness.base}/api/public/sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: qrToken }),
+      });
+      assert.equal(createRes.status, 201);
+      const sessionData = await createRes.json();
+      const sid = sessionData.sessionId;
+      const cred = sessionData.visitorCredential;
+
+      // 1. Owner accepts pending session
+      const acceptRes1 = await request(harness.base, ownerCookie, 'POST', `/sessions/${sid}/accept`, {});
+      assert.equal(acceptRes1.status, 200);
+      const acceptData1 = await acceptRes1.json();
+      assert.equal(acceptData1.status, 'accepted');
+
+      // 2. Re-accepting already accepted session is idempotent
+      const acceptRes2 = await request(harness.base, ownerCookie, 'POST', `/sessions/${sid}/accept`, {});
+      assert.equal(acceptRes2.status, 200);
+      const acceptData2 = await acceptRes2.json();
+      assert.equal(acceptData2.status, 'accepted');
+      assert.match(acceptData2.message, /already accepted/i);
+
+      // 3. Visitor closes accepted session
+      const closeRes = await fetch(`${harness.base}/api/public/sessions/${sid}/close`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Visitor-Credential': cred,
+        },
+      });
+      assert.equal(closeRes.status, 200);
+      const closeData = await closeRes.json();
+      assert.equal(closeData.status, 'closed');
+
+      // 4. Owner cannot accept a closed session
+      const acceptClosedRes = await request(harness.base, ownerCookie, 'POST', `/sessions/${sid}/accept`, {});
+      assert.equal(acceptClosedRes.status, 400);
+      const acceptClosedData = await acceptClosedRes.json();
+      assert.equal(acceptClosedData.status, 'closed');
+
+      // 5. Expiry boundary: artificially set session to expired in MySQL
+      const expCreateRes = await fetch(`${harness.base}/api/public/sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: qrToken }),
+      });
+      const expSessionRes = await expCreateRes.json();
+
+      const expSid = expSessionRes.sessionId;
+      await pool.query('UPDATE visitor_sessions SET expires_at = NOW() - INTERVAL 10 SECOND WHERE public_id = ?', [expSid]);
+
+      // Owner accept on expired session fails with 400
+      const acceptExpRes = await request(harness.base, ownerCookie, 'POST', `/sessions/${expSid}/accept`, {});
+      assert.equal(acceptExpRes.status, 400);
+      const acceptExpData = await acceptExpRes.json();
+      assert.equal(acceptExpData.status, 'expired');
+
+      // Owner close on expired session fails with 400
+      const closeExpRes = await request(harness.base, ownerCookie, 'POST', `/sessions/${expSid}/close`, {});
+      assert.equal(closeExpRes.status, 400);
+      const closeExpData = await closeExpRes.json();
+      assert.equal(closeExpData.status, 'expired');
+    });
+  });
+
+  await t.test('real MySQL migration 007 verification: schema integrity, incompatible tables, and rerun behavior', async (t) => {
+    await withDatabase(t, async (pool) => {
+      await migrate(pool);
+      const conn = await pool.getConnection();
+      try {
+        // Scenario 5: Correct schema accepted
+        await verifyVisitorSessionsSchema(conn);
+
+        // Scenario 6: Correct schema rerun idempotent
+        await migrate(pool);
+        await verifyVisitorSessionsSchema(conn);
+
+        // An unrecorded but incompatible pre-existing table must not be
+        // ledgered merely because CREATE TABLE IF NOT EXISTS would succeed.
+        await conn.query("DELETE FROM schema_migrations WHERE version = '007_visitor_sessions.sql'");
+        await conn.query('ALTER TABLE visitor_sessions MODIFY created_at TIMESTAMP NOT NULL');
+        await assert.rejects(
+          () => applyMigrations(pool),
+          /created_at column definition.*DEFAULT CURRENT_TIMESTAMP/
+        );
+        const [unrecorded] = await conn.query("SELECT version FROM schema_migrations WHERE version = '007_visitor_sessions.sql'");
+        assert.equal(unrecorded.length, 0, 'Migration 007 must not be recorded after schema verification fails');
+        await conn.query('ALTER TABLE visitor_sessions MODIFY created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP');
+        await conn.query("ALTER TABLE visitor_sessions MODIFY created_at TIMESTAMP NOT NULL DEFAULT '2000-01-01 00:00:00'");
+        await assert.rejects(
+          () => verifyVisitorSessionsSchema(conn),
+          /created_at column definition.*DEFAULT CURRENT_TIMESTAMP/
+        );
+        await conn.query('ALTER TABLE visitor_sessions MODIFY created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP');
+        await migrate(pool);
+
+        // Verify index idx_visitor_sessions_closed_status exists with correct columns
+        const [closedIdx] = await conn.query(
+          `SELECT COLUMN_NAME, SEQ_IN_INDEX
+           FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'visitor_sessions'
+             AND INDEX_NAME = 'idx_visitor_sessions_closed_status'
+           ORDER BY SEQ_IN_INDEX`
+        );
+        assert.equal(closedIdx.length, 2);
+        assert.equal(closedIdx[0].COLUMN_NAME, 'closed_at');
+        assert.equal(closedIdx[1].COLUMN_NAME, 'status');
+
+        // Scenario 1: Table with id INT UNSIGNED rejected
+        await conn.query('ALTER TABLE visitor_sessions MODIFY id INT UNSIGNED AUTO_INCREMENT');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /invalid id column definition on visitor_sessions: must be BIGINT UNSIGNED AUTO_INCREMENT/
+        );
+        // Restore id
+        await conn.query('ALTER TABLE visitor_sessions MODIFY id BIGINT UNSIGNED AUTO_INCREMENT');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Scenario 2: Table with vehicle_id BIGINT UNSIGNED rejected
+        await conn.query('ALTER TABLE visitor_sessions DROP FOREIGN KEY fk_visitor_sessions_vehicle_id');
+        await conn.query('ALTER TABLE visitor_sessions MODIFY vehicle_id BIGINT UNSIGNED NOT NULL');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /invalid vehicle_id column definition on visitor_sessions: must be INT UNSIGNED NOT NULL/
+        );
+        // Restore vehicle_id and foreign key
+        await conn.query('ALTER TABLE visitor_sessions MODIFY vehicle_id INT UNSIGNED NOT NULL');
+        await conn.query('ALTER TABLE visitor_sessions ADD CONSTRAINT fk_visitor_sessions_vehicle_id FOREIGN KEY (vehicle_id) REFERENCES vehicles(id) ON DELETE CASCADE');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Scenario 3: Table with status ENUM containing extra value rejected
+        await conn.query("ALTER TABLE visitor_sessions MODIFY status ENUM('pending','accepted','closed','expired','archived') NOT NULL DEFAULT 'pending'");
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /invalid status column definition on visitor_sessions: must be ENUM\('pending','accepted','closed','expired'\)/
+        );
+        // Restore status ENUM
+        await conn.query("ALTER TABLE visitor_sessions MODIFY status ENUM('pending','accepted','closed','expired') NOT NULL DEFAULT 'pending'");
+        await verifyVisitorSessionsSchema(conn);
+
+        // Scenario 4: Table with prefix unique index on public_id(10) rejected
+        await conn.query('ALTER TABLE visitor_sessions DROP INDEX uq_visitor_sessions_public_id');
+        await conn.query('ALTER TABLE visitor_sessions ADD UNIQUE KEY uq_visitor_sessions_public_id (public_id(10))');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /visitor_sessions public_id unique index must be a full-column index, prefix index is rejected/
+        );
+        // Restore full-column unique index
+        await conn.query('ALTER TABLE visitor_sessions DROP INDEX uq_visitor_sessions_public_id');
+        await conn.query('ALTER TABLE visitor_sessions ADD UNIQUE KEY uq_visitor_sessions_public_id (public_id)');
+        await verifyVisitorSessionsSchema(conn);
+
+        // A unique credential index is incompatible with the declared ordinary lookup index.
+        await conn.query('ALTER TABLE visitor_sessions DROP INDEX idx_visitor_sessions_credential_hash');
+        await conn.query('ALTER TABLE visitor_sessions ADD UNIQUE KEY idx_visitor_sessions_credential_hash (credential_hash)');
+        await assert.rejects(
+          () => verifyVisitorSessionsSchema(conn),
+          /requires an index on credential_hash/
+        );
+        await conn.query('ALTER TABLE visitor_sessions DROP INDEX idx_visitor_sessions_credential_hash');
+        await conn.query('ALTER TABLE visitor_sessions ADD KEY idx_visitor_sessions_credential_hash (credential_hash)');
+        await verifyVisitorSessionsSchema(conn);
+
+        // A cross-schema FK with the same table/column names must not pass.
+        const externalSchema = assertDisposableDatabaseName(`parkx_it_${randomBytes(6).toString('hex')}`);
+        assertDisposableDatabaseName(externalSchema);
+        await conn.query(`CREATE DATABASE \`${externalSchema}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
+        try {
+          await conn.query(`CREATE TABLE \`${externalSchema}\`.vehicles (id INT UNSIGNED NOT NULL PRIMARY KEY) ENGINE=InnoDB`);
+          await conn.query('ALTER TABLE visitor_sessions DROP FOREIGN KEY fk_visitor_sessions_vehicle_id');
+          await conn.query(`ALTER TABLE visitor_sessions ADD CONSTRAINT fk_visitor_sessions_vehicle_id FOREIGN KEY (vehicle_id) REFERENCES \`${externalSchema}\`.vehicles(id) ON DELETE CASCADE`);
+          await assert.rejects(
+            () => verifyVisitorSessionsSchema(conn),
+            /foreign key must be a single-column reference from vehicle_id to this schema vehicles\(id\)/
+          );
+          await conn.query('ALTER TABLE visitor_sessions DROP FOREIGN KEY fk_visitor_sessions_vehicle_id');
+          await conn.query('ALTER TABLE visitor_sessions ADD CONSTRAINT fk_visitor_sessions_vehicle_id FOREIGN KEY (vehicle_id) REFERENCES vehicles(id) ON DELETE CASCADE');
+          await verifyVisitorSessionsSchema(conn);
+        } finally {
+          assertDisposableDatabaseName(externalSchema);
+          await conn.query(`DROP DATABASE \`${externalSchema}\``);
+        }
+
+        // A composite FK beginning with vehicle_id must not be mistaken for the expected FK.
+        await conn.query('ALTER TABLE vehicles ADD UNIQUE KEY uq_test_vehicle_id_user_id (id, user_id)');
+        await conn.query('ALTER TABLE visitor_sessions ADD COLUMN fk_user_id BIGINT UNSIGNED NOT NULL DEFAULT 1');
+        await conn.query('ALTER TABLE visitor_sessions DROP FOREIGN KEY fk_visitor_sessions_vehicle_id');
+        await conn.query('ALTER TABLE visitor_sessions ADD CONSTRAINT fk_visitor_sessions_vehicle_id FOREIGN KEY (vehicle_id, fk_user_id) REFERENCES vehicles(id, user_id) ON DELETE CASCADE');
+        await assert.rejects(
+          () => verifyVisitorSessionsSchema(conn),
+          /foreign key must be a single-column reference from vehicle_id to this schema vehicles\(id\)/
+        );
+        await conn.query('ALTER TABLE visitor_sessions DROP FOREIGN KEY fk_visitor_sessions_vehicle_id');
+        await conn.query('ALTER TABLE visitor_sessions DROP COLUMN fk_user_id');
+        await conn.query('ALTER TABLE vehicles DROP INDEX uq_test_vehicle_id_user_id');
+        await conn.query('ALTER TABLE visitor_sessions ADD CONSTRAINT fk_visitor_sessions_vehicle_id FOREIGN KEY (vehicle_id) REFERENCES vehicles(id) ON DELETE CASCADE');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Foreign key integrity check: drop FK and assert rejection
+        await conn.query('ALTER TABLE visitor_sessions DROP FOREIGN KEY fk_visitor_sessions_vehicle_id');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /foreign key must be a single-column reference from vehicle_id to this schema vehicles\(id\)/
+        );
+        // Restore foreign key
+        await conn.query('ALTER TABLE visitor_sessions ADD CONSTRAINT fk_visitor_sessions_vehicle_id FOREIGN KEY (vehicle_id) REFERENCES vehicles(id) ON DELETE CASCADE');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Invisible index rejection: make required index invisible and verify rejection
+        await conn.query('ALTER TABLE visitor_sessions ALTER INDEX idx_visitor_sessions_credential_hash INVISIBLE');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /index idx_visitor_sessions_credential_hash on visitor_sessions is invisible/
+        );
+        // Restore index visibility and verify schema passes
+        await conn.query('ALTER TABLE visitor_sessions ALTER INDEX idx_visitor_sessions_credential_hash VISIBLE');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Invisible index rejection on unique index: make public_id unique index invisible and verify rejection
+        await conn.query('ALTER TABLE visitor_sessions ALTER INDEX uq_visitor_sessions_public_id INVISIBLE');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /index uq_visitor_sessions_public_id on visitor_sessions is invisible/
+        );
+        // Restore unique index visibility and verify schema passes
+        await conn.query('ALTER TABLE visitor_sessions ALTER INDEX uq_visitor_sessions_public_id VISIBLE');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Invisible index rejection on compound index: make idx_visitor_sessions_closed_status invisible
+        await conn.query('ALTER TABLE visitor_sessions ALTER INDEX idx_visitor_sessions_closed_status INVISIBLE');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /index idx_visitor_sessions_closed_status on visitor_sessions is invisible/
+        );
+        // Restore compound index visibility and verify schema passes
+        await conn.query('ALTER TABLE visitor_sessions ALTER INDEX idx_visitor_sessions_closed_status VISIBLE');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Column contract: unexpected default on expires_at rejected
+        await conn.query('ALTER TABLE visitor_sessions MODIFY expires_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /invalid expires_at column definition on visitor_sessions: must be TIMESTAMP NOT NULL without a default or ON UPDATE clause/
+        );
+        await conn.query('ALTER TABLE visitor_sessions MODIFY expires_at TIMESTAMP NOT NULL');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Column contract: unexpected ON UPDATE on expires_at rejected
+        await conn.query('ALTER TABLE visitor_sessions MODIFY expires_at TIMESTAMP NOT NULL ON UPDATE CURRENT_TIMESTAMP');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /invalid expires_at column definition on visitor_sessions: must be TIMESTAMP NOT NULL without a default or ON UPDATE clause/
+        );
+        await conn.query('ALTER TABLE visitor_sessions MODIFY expires_at TIMESTAMP NOT NULL');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Column contract: unexpected default on accepted_at rejected
+        await conn.query('ALTER TABLE visitor_sessions MODIFY accepted_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /invalid accepted_at column definition on visitor_sessions: must explicitly specify DEFAULT NULL in DDL/
+        );
+        await conn.query('ALTER TABLE visitor_sessions MODIFY accepted_at TIMESTAMP NULL DEFAULT NULL');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Column contract: nullable timestamp with omitted DEFAULT NULL rejected
+        await conn.query('ALTER TABLE visitor_sessions MODIFY accepted_at TIMESTAMP NULL');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /invalid accepted_at column definition on visitor_sessions: must explicitly specify DEFAULT NULL in DDL/
+        );
+        await conn.query('ALTER TABLE visitor_sessions MODIFY accepted_at TIMESTAMP NULL DEFAULT NULL');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Column contract: unexpected ON UPDATE on accepted_at rejected
+        await conn.query('ALTER TABLE visitor_sessions MODIFY accepted_at TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /invalid accepted_at column definition on visitor_sessions: must explicitly specify DEFAULT NULL in DDL/
+        );
+        await conn.query('ALTER TABLE visitor_sessions MODIFY accepted_at TIMESTAMP NULL DEFAULT NULL');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Column contract: unexpected default on closed_at rejected
+        await conn.query('ALTER TABLE visitor_sessions MODIFY closed_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /invalid closed_at column definition on visitor_sessions: must explicitly specify DEFAULT NULL in DDL/
+        );
+        await conn.query('ALTER TABLE visitor_sessions MODIFY closed_at TIMESTAMP NULL DEFAULT NULL');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Column contract: nullable closed_at with omitted DEFAULT NULL rejected
+        await conn.query('ALTER TABLE visitor_sessions MODIFY closed_at TIMESTAMP NULL');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /invalid closed_at column definition on visitor_sessions: must explicitly specify DEFAULT NULL in DDL/
+        );
+        await conn.query('ALTER TABLE visitor_sessions MODIFY closed_at TIMESTAMP NULL DEFAULT NULL');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Column contract: unexpected ON UPDATE on closed_at rejected
+        await conn.query('ALTER TABLE visitor_sessions MODIFY closed_at TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /invalid closed_at column definition on visitor_sessions: must explicitly specify DEFAULT NULL in DDL/
+        );
+        await conn.query('ALTER TABLE visitor_sessions MODIFY closed_at TIMESTAMP NULL DEFAULT NULL');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Column contract: unexpected ON UPDATE on created_at rejected
+        await conn.query('ALTER TABLE visitor_sessions MODIFY created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /invalid created_at column definition on visitor_sessions: must be TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP without ON UPDATE/
+        );
+        await conn.query('ALTER TABLE visitor_sessions MODIFY created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Renamed expected index rejected
+        await conn.query('ALTER TABLE visitor_sessions RENAME INDEX idx_visitor_sessions_credential_hash TO idx_visitor_sessions_cred_renamed');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /unexpected extra index idx_visitor_sessions_cred_renamed found on visitor_sessions|missing required index idx_visitor_sessions_credential_hash/
+        );
+        await conn.query('ALTER TABLE visitor_sessions RENAME INDEX idx_visitor_sessions_cred_renamed TO idx_visitor_sessions_credential_hash');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Unexpected extra index rejected
+        await conn.query('ALTER TABLE visitor_sessions ADD KEY idx_extra_test (created_at)');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /unexpected extra index idx_extra_test found on visitor_sessions/
+        );
+        await conn.query('ALTER TABLE visitor_sessions DROP INDEX idx_extra_test');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Wrong index column order rejected
+        await conn.query('ALTER TABLE visitor_sessions DROP INDEX idx_visitor_sessions_expires_status');
+        await conn.query('ALTER TABLE visitor_sessions ADD KEY idx_visitor_sessions_expires_status (status, expires_at)');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /index idx_visitor_sessions_expires_status column at position 1 must be expires_at, found status/
+        );
+        await conn.query('ALTER TABLE visitor_sessions DROP INDEX idx_visitor_sessions_expires_status');
+        await conn.query('ALTER TABLE visitor_sessions ADD KEY idx_visitor_sessions_expires_status (expires_at, status)');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Wrong table collation rejected
+        await conn.query('ALTER TABLE visitor_sessions COLLATE utf8mb4_general_ci');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /visitor_sessions table collation must be utf8mb4_unicode_ci/
+        );
+        await conn.query('ALTER TABLE visitor_sessions COLLATE utf8mb4_unicode_ci');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Wrong ENUM collation rejected
+        await conn.query("ALTER TABLE visitor_sessions MODIFY status ENUM('pending','accepted','closed','expired') CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL DEFAULT 'pending'");
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /must be ENUM\('pending','accepted','closed','expired'\) NOT NULL DEFAULT 'pending' with utf8mb4_unicode_ci collation/
+        );
+        await conn.query("ALTER TABLE visitor_sessions MODIFY status ENUM('pending','accepted','closed','expired') CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'pending'");
+        await verifyVisitorSessionsSchema(conn);
+
+        // Column contract: explicit DEFAULT NULL on non-timestamp column rejected
+        await conn.query('ALTER TABLE visitor_sessions MODIFY public_id VARCHAR(64) NULL DEFAULT NULL');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /invalid public_id column definition on visitor_sessions: must be VARCHAR\(64\) NOT NULL without defaults in DDL/
+        );
+        await conn.query('ALTER TABLE visitor_sessions MODIFY public_id VARCHAR(64) NOT NULL');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Column contract: unexpected non-NULL default on vehicle_id rejected
+        await conn.query('ALTER TABLE visitor_sessions MODIFY vehicle_id INT UNSIGNED NOT NULL DEFAULT 1');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /invalid vehicle_id column definition on visitor_sessions: must be INT UNSIGNED NOT NULL without defaults in DDL/
+        );
+        await conn.query('ALTER TABLE visitor_sessions MODIFY vehicle_id INT UNSIGNED NOT NULL');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Foreign key name: wrong constraint name rejected
+        await conn.query('ALTER TABLE visitor_sessions DROP FOREIGN KEY fk_visitor_sessions_vehicle_id');
+        await conn.query('ALTER TABLE visitor_sessions ADD CONSTRAINT fk_visitor_sessions_vehicle_wrong_name FOREIGN KEY (vehicle_id) REFERENCES vehicles (id) ON DELETE CASCADE');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /foreign key must be named fk_visitor_sessions_vehicle_id/
+        );
+        await conn.query('ALTER TABLE visitor_sessions DROP FOREIGN KEY fk_visitor_sessions_vehicle_wrong_name');
+        await conn.query('ALTER TABLE visitor_sessions ADD CONSTRAINT fk_visitor_sessions_vehicle_id FOREIGN KEY (vehicle_id) REFERENCES vehicles (id) ON DELETE CASCADE');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Column contract: generated column rejected
+        await conn.query('ALTER TABLE visitor_sessions DROP FOREIGN KEY fk_visitor_sessions_vehicle_id');
+        await conn.query('ALTER TABLE visitor_sessions MODIFY vehicle_id INT UNSIGNED AS (1 + 1) VIRTUAL');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /must not be a generated column/
+        );
+        await conn.query('ALTER TABLE visitor_sessions MODIFY vehicle_id INT UNSIGNED NOT NULL');
+        await conn.query('ALTER TABLE visitor_sessions ADD CONSTRAINT fk_visitor_sessions_vehicle_id FOREIGN KEY (vehicle_id) REFERENCES vehicles (id) ON DELETE CASCADE');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Column contract: invisible column rejected
+        await conn.query('ALTER TABLE visitor_sessions MODIFY credential_hash VARCHAR(64) INVISIBLE');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /must not be an invisible column|invalid credential_hash column definition/
+        );
+        await conn.query('ALTER TABLE visitor_sessions MODIFY credential_hash VARCHAR(64) VISIBLE');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Index direction: descending index column rejected
+        await conn.query('ALTER TABLE visitor_sessions DROP INDEX idx_visitor_sessions_expires_status');
+        await conn.query('ALTER TABLE visitor_sessions ADD KEY idx_visitor_sessions_expires_status (expires_at DESC, status ASC)');
+        await assert.rejects(
+          async () => verifyVisitorSessionsSchema(conn),
+          /index idx_visitor_sessions_expires_status column expires_at must have ascending direction \('A'\), found 'D'/
+        );
+        await conn.query('ALTER TABLE visitor_sessions DROP INDEX idx_visitor_sessions_expires_status');
+        await conn.query('ALTER TABLE visitor_sessions ADD KEY idx_visitor_sessions_expires_status (expires_at, status)');
+        await verifyVisitorSessionsSchema(conn);
+
+        // Column contract: verification rejection before migration-ledger insertion
+        await conn.query("DELETE FROM schema_migrations WHERE version = '007_visitor_sessions.sql'");
+        await conn.query('ALTER TABLE visitor_sessions MODIFY expires_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP');
+        await assert.rejects(
+          async () => applyMigrations(pool),
+          /invalid expires_at column definition on visitor_sessions/
+        );
+        const [ledgerCheck] = await conn.query("SELECT version FROM schema_migrations WHERE version = '007_visitor_sessions.sql'");
+        assert.equal(ledgerCheck.length, 0, 'Migration 007 must not be recorded when column contract verification fails');
+        // Restore expires_at and re-run migration to verify it records successfully
+        await conn.query('ALTER TABLE visitor_sessions MODIFY expires_at TIMESTAMP NOT NULL');
+        await applyMigrations(pool);
+        const [restoredLedger] = await conn.query("SELECT version FROM schema_migrations WHERE version = '007_visitor_sessions.sql'");
+        assert.equal(restoredLedger.length, 1, 'Migration 007 must be recorded when column contract is valid');
+      } finally {
+        conn.release();
+      }
+    });
+  });
+
+  await t.test('real MySQL genuinely concurrent state transitions with Promise.all', async (t) => {
+    await withDatabase(t, async (pool) => {
+      await migrate(pool);
+      const harness = await makeApp(pool);
+      t.after(() => harness.server.close());
+
+      const [uRes] = await pool.query("INSERT INTO users (full_name, email, password_hash) VALUES ('Concurrent State User', 'concurrent-state@parkx.ai', 'hash')");
+      const userId = uRes.insertId;
+      const ownerCookie = await sessionFor(harness.base, userId);
+
+      const vRes = await request(harness.base, ownerCookie, 'POST', '', {
+        registration_number: 'CONC-STAT-1',
+        vehicle_type: 'car',
+        vehicle_model: 'Porsche 911',
+        color: 'Guards Red',
+      });
+      const vData = await vRes.json();
+      const qrToken = vData.vehicle.qrCode.token;
+
+      // Helper to create a fresh session
+      const createSession = async () => {
+        const res = await fetch(`${harness.base}/api/public/sessions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: qrToken }),
+        });
+        assert.equal(res.status, 201);
+        return res.json();
+      };
+
+      // 1. Owner accept racing with owner close on the same session
+      const s1 = await createSession();
+      const [resAccept, resClose] = await Promise.all([
+        request(harness.base, ownerCookie, 'POST', `/sessions/${s1.sessionId}/accept`, {}),
+        request(harness.base, ownerCookie, 'POST', `/sessions/${s1.sessionId}/close`, {}),
+      ]);
+      const [s1Db] = await pool.query('SELECT status FROM visitor_sessions WHERE public_id = ?', [s1.sessionId]);
+      assert.ok(['accepted', 'closed'].includes(s1Db[0].status));
+      assert.ok([200, 400].includes(resAccept.status));
+      assert.ok([200, 400].includes(resClose.status));
+
+      // 2. Visitor close racing with owner accept on the same session
+      const s2 = await createSession();
+      const [resVisitorClose, resOwnerAccept] = await Promise.all([
+        fetch(`${harness.base}/api/public/sessions/${s2.sessionId}/close`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Visitor-Credential': s2.visitorCredential,
+          },
+        }),
+        request(harness.base, ownerCookie, 'POST', `/sessions/${s2.sessionId}/accept`, {}),
+      ]);
+      const [s2Db] = await pool.query('SELECT status FROM visitor_sessions WHERE public_id = ?', [s2.sessionId]);
+      assert.ok(['accepted', 'closed'].includes(s2Db[0].status));
+      assert.ok([200, 400].includes(resVisitorClose.status));
+      assert.ok([200, 400].includes(resOwnerAccept.status));
+
+      // 3. Expiration racing with close
+      const s3 = await createSession();
+      // Set expires_at to 1 second ago so cleanup sees it as expired
+      await pool.query('UPDATE visitor_sessions SET expires_at = NOW() - INTERVAL 1 SECOND WHERE public_id = ?', [s3.sessionId]);
+      const [cleanupRes, closeRes] = await Promise.all([
+        runVisitorSessionCleanup(pool),
+        fetch(`${harness.base}/api/public/sessions/${s3.sessionId}/close`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Visitor-Credential': s3.visitorCredential,
+          },
+        }),
+      ]);
+      const [s3Db] = await pool.query('SELECT status FROM visitor_sessions WHERE public_id = ?', [s3.sessionId]);
+      assert.ok(['expired', 'closed'].includes(s3Db[0].status));
+      if (s3Db[0].status === 'expired') {
+        assert.equal(closeRes.status, 410);
+      } else {
+        assert.equal(closeRes.status, 200);
+      }
+    });
+  });
+
+  await t.test('real MySQL concurrent session creation and QR rotation with standardized lock ordering', async (t) => {
+    await withDatabase(t, async (pool) => {
+      await migrate(pool);
+      const harness = await makeApp(pool);
+      t.after(() => harness.server.close());
+
+      const [uRes] = await pool.query("INSERT INTO users (full_name, email, password_hash) VALUES ('Lock Order User', 'lock-order@parkx.ai', 'hash')");
+      const userId = uRes.insertId;
+      const ownerCookie = await sessionFor(harness.base, userId);
+
+      const vRes = await request(harness.base, ownerCookie, 'POST', '', {
+        registration_number: 'LOCK-ORD-1',
+        vehicle_type: 'suv',
+        vehicle_model: 'Volvo EX90',
+        color: 'Denim Blue',
+      });
+      const vData = await vRes.json();
+      const vehicleId = vData.vehicle.id;
+      const initialToken = vData.vehicle.qrCode.token;
+
+      // Concurrently run 6 session creations using the initial token AND 2 QR rotations
+      const sessionCreations = Array.from({ length: 6 }).map(() =>
+        fetch(`${harness.base}/api/public/sessions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: initialToken }),
+        })
+      );
+      const qrRotations = Array.from({ length: 2 }).map(() =>
+        request(harness.base, ownerCookie, 'POST', `/${vehicleId}/qr/rotate`, {})
+      );
+
+      const results = await Promise.all([...sessionCreations, ...qrRotations]);
+      // Verify all requests finished with valid HTTP statuses without hanging or unhandled deadlocks
+      for (const res of results) {
+        assert.ok([200, 201, 410, 429].includes(res.status), `Unexpected status: ${res.status}`);
+      }
+
+      // Verify DB consistency: exactly 1 active QR code exists for the vehicle
+      const [activeQrs] = await pool.query(
+        "SELECT COUNT(*) AS n FROM qr_codes WHERE vehicle_id = ? AND status = 'active'",
+        [vehicleId]
+      );
+      assert.equal(Number(activeQrs[0].n), 1);
+
+      // Verify DB consistency: pending sessions count cannot exceed 5
+      const [pendingSessions] = await pool.query(
+        "SELECT COUNT(*) AS n FROM visitor_sessions WHERE vehicle_id = ? AND status = 'pending'",
+        [vehicleId]
+      );
+      assert.ok(Number(pendingSessions[0].n) <= 5);
+
+      // Verify connection pool is healthy and responsive
+      const [ping] = await pool.query('SELECT 1 AS alive');
+      assert.equal(ping[0].alive, 1);
+    });
+  });
+
+  await t.test('real MySQL session retention cleanup: transitions expired and purges past 30 days', async (t) => {
+    await withDatabase(t, async (pool) => {
+      await migrate(pool);
+      const [uRes] = await pool.query("INSERT INTO users (full_name, email, password_hash) VALUES ('Retention User', 'retention-test@parkx.ai', 'hash')");
+      const userId = uRes.insertId;
+      const [vRes] = await pool.query(
+        "INSERT INTO vehicles (user_id, registration_number, vehicle_type, vehicle_model, color) VALUES (?, 'RET-1', 'car', 'M', 'C')",
+        [userId]
+      );
+      const vId = vRes.insertId;
+
+      const credHash = createHash('sha256').update('vcred_sample').digest('hex');
+
+      // 1. Pending session within TTL (expires in 12h)
+      await pool.query(
+        `INSERT INTO visitor_sessions (public_id, vehicle_id, credential_hash, status, created_at, expires_at)
+         VALUES ('vs_clean_active', ?, ?, 'pending', NOW(), NOW() + INTERVAL 12 HOUR)`,
+        [vId, credHash]
+      );
+
+      // 2. Pending session past TTL (expired 2h ago)
+      await pool.query(
+        `INSERT INTO visitor_sessions (public_id, vehicle_id, credential_hash, status, created_at, expires_at)
+         VALUES ('vs_clean_past_ttl', ?, ?, 'pending', NOW() - INTERVAL 26 HOUR, NOW() - INTERVAL 2 HOUR)`,
+        [vId, credHash]
+      );
+
+      // 3. Closed session retained (closed 10 days ago, < 30 days)
+      await pool.query(
+        `INSERT INTO visitor_sessions (public_id, vehicle_id, credential_hash, status, created_at, expires_at, closed_at)
+         VALUES ('vs_clean_closed_recent', ?, ?, 'closed', NOW() - INTERVAL 12 DAY, NOW() - INTERVAL 11 DAY, NOW() - INTERVAL 10 DAY)`,
+        [vId, credHash]
+      );
+
+      // 4. Closed session past retention (closed 35 days ago, > 30 days)
+      await pool.query(
+        `INSERT INTO visitor_sessions (public_id, vehicle_id, credential_hash, status, created_at, expires_at, closed_at)
+         VALUES ('vs_clean_closed_old', ?, ?, 'closed', NOW() - INTERVAL 37 DAY, NOW() - INTERVAL 36 DAY, NOW() - INTERVAL 35 DAY)`,
+        [vId, credHash]
+      );
+
+      // Execute cleanup
+      const result = await runVisitorSessionCleanup(pool, { retentionDays: 30 });
+      assert.equal(result.expiredCount, 1);
+      assert.equal(result.deletedCount, 1);
+
+      // Verify active pending session is still pending
+      const [activeRows] = await pool.query("SELECT status FROM visitor_sessions WHERE public_id = 'vs_clean_active'");
+      assert.equal(activeRows[0].status, 'pending');
+
+      // Verify past TTL session was marked expired
+      const [expiredRows] = await pool.query("SELECT status FROM visitor_sessions WHERE public_id = 'vs_clean_past_ttl'");
+      assert.equal(expiredRows[0].status, 'expired');
+
+      // Verify recent closed session was preserved
+      const [recentRows] = await pool.query("SELECT status FROM visitor_sessions WHERE public_id = 'vs_clean_closed_recent'");
+      assert.equal(recentRows.length, 1);
+
+      // Verify old closed session was purged
+      const [oldRows] = await pool.query("SELECT status FROM visitor_sessions WHERE public_id = 'vs_clean_closed_old'");
+      assert.equal(oldRows.length, 0);
     });
   });
 });
