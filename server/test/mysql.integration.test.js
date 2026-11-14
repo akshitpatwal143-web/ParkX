@@ -795,7 +795,7 @@ test('MySQL migration and vehicle integrity integration', { skip: !enabled }, as
         await conn.query('ALTER TABLE visitor_sessions ADD UNIQUE KEY uq_visitor_sessions_public_id (public_id(10))');
         await assert.rejects(
           async () => verifyVisitorSessionsSchema(conn),
-          /visitor_sessions public_id unique index must be a full-column index, prefix index is rejected/
+          /index uq_visitor_sessions_public_id must be a full-column index; prefix index \(sub_part=10\) is rejected/
         );
         // Restore full-column unique index
         await conn.query('ALTER TABLE visitor_sessions DROP INDEX uq_visitor_sessions_public_id');
@@ -807,7 +807,7 @@ test('MySQL migration and vehicle integrity integration', { skip: !enabled }, as
         await conn.query('ALTER TABLE visitor_sessions ADD UNIQUE KEY idx_visitor_sessions_credential_hash (credential_hash)');
         await assert.rejects(
           () => verifyVisitorSessionsSchema(conn),
-          /requires an index on credential_hash/
+          /index idx_visitor_sessions_credential_hash on visitor_sessions has incorrect uniqueness: expected unique=false/
         );
         await conn.query('ALTER TABLE visitor_sessions DROP INDEX idx_visitor_sessions_credential_hash');
         await conn.query('ALTER TABLE visitor_sessions ADD KEY idx_visitor_sessions_credential_hash (credential_hash)');
@@ -823,7 +823,7 @@ test('MySQL migration and vehicle integrity integration', { skip: !enabled }, as
           await conn.query(`ALTER TABLE visitor_sessions ADD CONSTRAINT fk_visitor_sessions_vehicle_id FOREIGN KEY (vehicle_id) REFERENCES \`${externalSchema}\`.vehicles(id) ON DELETE CASCADE`);
           await assert.rejects(
             () => verifyVisitorSessionsSchema(conn),
-            /foreign key must be a single-column reference from vehicle_id to this schema vehicles\(id\)/
+            /foreign key must be named fk_visitor_sessions_vehicle_id and reference vehicle_id to vehicles\(id\) with ON DELETE CASCADE/
           );
           await conn.query('ALTER TABLE visitor_sessions DROP FOREIGN KEY fk_visitor_sessions_vehicle_id');
           await conn.query('ALTER TABLE visitor_sessions ADD CONSTRAINT fk_visitor_sessions_vehicle_id FOREIGN KEY (vehicle_id) REFERENCES vehicles(id) ON DELETE CASCADE');
@@ -834,17 +834,21 @@ test('MySQL migration and vehicle integrity integration', { skip: !enabled }, as
         }
 
         // A composite FK beginning with vehicle_id must not be mistaken for the expected FK.
-        await conn.query('ALTER TABLE vehicles ADD UNIQUE KEY uq_test_vehicle_id_user_id (id, user_id)');
-        await conn.query('ALTER TABLE visitor_sessions ADD COLUMN fk_user_id BIGINT UNSIGNED NOT NULL DEFAULT 1');
+        // We add a matching column on vehicles (test_status) and reference (vehicle_id, status)
+        // because (vehicle_id, status) is a prefix of idx_visitor_sessions_vehicle_status (vehicle_id, status, created_at).
+        // This keeps visitor_sessions strictly at 9 columns and 6 indexes, proving that the rejection
+        // is triggered directly by the composite foreign key check (validFk.length !== 1).
+        await conn.query("ALTER TABLE vehicles ADD COLUMN test_status ENUM('pending','accepted','closed','expired') NOT NULL DEFAULT 'pending'");
+        await conn.query('ALTER TABLE vehicles ADD UNIQUE KEY uq_vehicles_id_status (id, test_status)');
         await conn.query('ALTER TABLE visitor_sessions DROP FOREIGN KEY fk_visitor_sessions_vehicle_id');
-        await conn.query('ALTER TABLE visitor_sessions ADD CONSTRAINT fk_visitor_sessions_vehicle_id FOREIGN KEY (vehicle_id, fk_user_id) REFERENCES vehicles(id, user_id) ON DELETE CASCADE');
+        await conn.query('ALTER TABLE visitor_sessions ADD CONSTRAINT fk_visitor_sessions_vehicle_id FOREIGN KEY (vehicle_id, status) REFERENCES vehicles(id, test_status) ON DELETE CASCADE');
         await assert.rejects(
           () => verifyVisitorSessionsSchema(conn),
-          /foreign key must be a single-column reference from vehicle_id to this schema vehicles\(id\)/
+          /foreign key must be named fk_visitor_sessions_vehicle_id and reference vehicle_id to vehicles\(id\) with ON DELETE CASCADE/
         );
         await conn.query('ALTER TABLE visitor_sessions DROP FOREIGN KEY fk_visitor_sessions_vehicle_id');
-        await conn.query('ALTER TABLE visitor_sessions DROP COLUMN fk_user_id');
-        await conn.query('ALTER TABLE vehicles DROP INDEX uq_test_vehicle_id_user_id');
+        await conn.query('ALTER TABLE vehicles DROP INDEX uq_vehicles_id_status');
+        await conn.query('ALTER TABLE vehicles DROP COLUMN test_status');
         await conn.query('ALTER TABLE visitor_sessions ADD CONSTRAINT fk_visitor_sessions_vehicle_id FOREIGN KEY (vehicle_id) REFERENCES vehicles(id) ON DELETE CASCADE');
         await verifyVisitorSessionsSchema(conn);
 
@@ -852,7 +856,7 @@ test('MySQL migration and vehicle integrity integration', { skip: !enabled }, as
         await conn.query('ALTER TABLE visitor_sessions DROP FOREIGN KEY fk_visitor_sessions_vehicle_id');
         await assert.rejects(
           async () => verifyVisitorSessionsSchema(conn),
-          /foreign key must be a single-column reference from vehicle_id to this schema vehicles\(id\)/
+          /foreign key must be named fk_visitor_sessions_vehicle_id and reference vehicle_id to vehicles\(id\) with ON DELETE CASCADE/
         );
         // Restore foreign key
         await conn.query('ALTER TABLE visitor_sessions ADD CONSTRAINT fk_visitor_sessions_vehicle_id FOREIGN KEY (vehicle_id) REFERENCES vehicles(id) ON DELETE CASCADE');
@@ -910,16 +914,19 @@ test('MySQL migration and vehicle integrity integration', { skip: !enabled }, as
         await conn.query('ALTER TABLE visitor_sessions MODIFY accepted_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP');
         await assert.rejects(
           async () => verifyVisitorSessionsSchema(conn),
-          /invalid accepted_at column definition on visitor_sessions: must explicitly specify DEFAULT NULL in DDL/
+          /invalid accepted_at column definition on visitor_sessions: must be TIMESTAMP NULL DEFAULT NULL without an unexpected default or ON UPDATE clause/
         );
         await conn.query('ALTER TABLE visitor_sessions MODIFY accepted_at TIMESTAMP NULL DEFAULT NULL');
         await verifyVisitorSessionsSchema(conn);
 
-        // Column contract: nullable timestamp with omitted DEFAULT NULL rejected
-        await conn.query('ALTER TABLE visitor_sessions MODIFY accepted_at TIMESTAMP NULL');
+        // Column contract: non-nullable timestamp on accepted_at rejected.
+        // Note: In MySQL 8.4, `TIMESTAMP NULL` automatically normalizes to `timestamp NULL DEFAULT NULL`
+        // in information_schema and SHOW CREATE TABLE. An omitted DEFAULT NULL cannot be distinguished
+        // or represented in MySQL 8.4; this test verifies that declaring accepted_at as NOT NULL is rejected.
+        await conn.query('ALTER TABLE visitor_sessions MODIFY accepted_at TIMESTAMP NOT NULL');
         await assert.rejects(
           async () => verifyVisitorSessionsSchema(conn),
-          /invalid accepted_at column definition on visitor_sessions: must explicitly specify DEFAULT NULL in DDL/
+          /invalid accepted_at column definition on visitor_sessions: must be TIMESTAMP NULL DEFAULT NULL without an unexpected default or ON UPDATE clause/
         );
         await conn.query('ALTER TABLE visitor_sessions MODIFY accepted_at TIMESTAMP NULL DEFAULT NULL');
         await verifyVisitorSessionsSchema(conn);
@@ -928,7 +935,7 @@ test('MySQL migration and vehicle integrity integration', { skip: !enabled }, as
         await conn.query('ALTER TABLE visitor_sessions MODIFY accepted_at TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP');
         await assert.rejects(
           async () => verifyVisitorSessionsSchema(conn),
-          /invalid accepted_at column definition on visitor_sessions: must explicitly specify DEFAULT NULL in DDL/
+          /invalid accepted_at column definition on visitor_sessions: must be TIMESTAMP NULL DEFAULT NULL without an unexpected default or ON UPDATE clause/
         );
         await conn.query('ALTER TABLE visitor_sessions MODIFY accepted_at TIMESTAMP NULL DEFAULT NULL');
         await verifyVisitorSessionsSchema(conn);
@@ -937,16 +944,19 @@ test('MySQL migration and vehicle integrity integration', { skip: !enabled }, as
         await conn.query('ALTER TABLE visitor_sessions MODIFY closed_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP');
         await assert.rejects(
           async () => verifyVisitorSessionsSchema(conn),
-          /invalid closed_at column definition on visitor_sessions: must explicitly specify DEFAULT NULL in DDL/
+          /invalid closed_at column definition on visitor_sessions: must be TIMESTAMP NULL DEFAULT NULL without an unexpected default or ON UPDATE clause/
         );
         await conn.query('ALTER TABLE visitor_sessions MODIFY closed_at TIMESTAMP NULL DEFAULT NULL');
         await verifyVisitorSessionsSchema(conn);
 
-        // Column contract: nullable closed_at with omitted DEFAULT NULL rejected
-        await conn.query('ALTER TABLE visitor_sessions MODIFY closed_at TIMESTAMP NULL');
+        // Column contract: non-nullable timestamp on closed_at rejected.
+        // Note: In MySQL 8.4, `TIMESTAMP NULL` automatically normalizes to `timestamp NULL DEFAULT NULL`
+        // in information_schema and SHOW CREATE TABLE. An omitted DEFAULT NULL cannot be distinguished
+        // or represented in MySQL 8.4; this test verifies that declaring closed_at as NOT NULL is rejected.
+        await conn.query('ALTER TABLE visitor_sessions MODIFY closed_at TIMESTAMP NOT NULL');
         await assert.rejects(
           async () => verifyVisitorSessionsSchema(conn),
-          /invalid closed_at column definition on visitor_sessions: must explicitly specify DEFAULT NULL in DDL/
+          /invalid closed_at column definition on visitor_sessions: must be TIMESTAMP NULL DEFAULT NULL without an unexpected default or ON UPDATE clause/
         );
         await conn.query('ALTER TABLE visitor_sessions MODIFY closed_at TIMESTAMP NULL DEFAULT NULL');
         await verifyVisitorSessionsSchema(conn);
@@ -955,7 +965,7 @@ test('MySQL migration and vehicle integrity integration', { skip: !enabled }, as
         await conn.query('ALTER TABLE visitor_sessions MODIFY closed_at TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP');
         await assert.rejects(
           async () => verifyVisitorSessionsSchema(conn),
-          /invalid closed_at column definition on visitor_sessions: must explicitly specify DEFAULT NULL in DDL/
+          /invalid closed_at column definition on visitor_sessions: must be TIMESTAMP NULL DEFAULT NULL without an unexpected default or ON UPDATE clause/
         );
         await conn.query('ALTER TABLE visitor_sessions MODIFY closed_at TIMESTAMP NULL DEFAULT NULL');
         await verifyVisitorSessionsSchema(conn);
@@ -1020,7 +1030,7 @@ test('MySQL migration and vehicle integrity integration', { skip: !enabled }, as
         await conn.query('ALTER TABLE visitor_sessions MODIFY public_id VARCHAR(64) NULL DEFAULT NULL');
         await assert.rejects(
           async () => verifyVisitorSessionsSchema(conn),
-          /invalid public_id column definition on visitor_sessions: must be VARCHAR\(64\) NOT NULL without defaults in DDL/
+          /invalid public_id column definition on visitor_sessions: must be VARCHAR\(64\) NOT NULL\./
         );
         await conn.query('ALTER TABLE visitor_sessions MODIFY public_id VARCHAR(64) NOT NULL');
         await verifyVisitorSessionsSchema(conn);
@@ -1029,7 +1039,7 @@ test('MySQL migration and vehicle integrity integration', { skip: !enabled }, as
         await conn.query('ALTER TABLE visitor_sessions MODIFY vehicle_id INT UNSIGNED NOT NULL DEFAULT 1');
         await assert.rejects(
           async () => verifyVisitorSessionsSchema(conn),
-          /invalid vehicle_id column definition on visitor_sessions: must be INT UNSIGNED NOT NULL without defaults in DDL/
+          /invalid vehicle_id column definition on visitor_sessions: must be INT UNSIGNED NOT NULL\./
         );
         await conn.query('ALTER TABLE visitor_sessions MODIFY vehicle_id INT UNSIGNED NOT NULL');
         await verifyVisitorSessionsSchema(conn);
@@ -1046,23 +1056,21 @@ test('MySQL migration and vehicle integrity integration', { skip: !enabled }, as
         await verifyVisitorSessionsSchema(conn);
 
         // Column contract: generated column rejected
-        await conn.query('ALTER TABLE visitor_sessions DROP FOREIGN KEY fk_visitor_sessions_vehicle_id');
-        await conn.query('ALTER TABLE visitor_sessions MODIFY vehicle_id INT UNSIGNED AS (1 + 1) VIRTUAL');
+        await conn.query('ALTER TABLE visitor_sessions DROP COLUMN accepted_at, ADD COLUMN accepted_at INT AS (1 + 1) VIRTUAL AFTER expires_at');
         await assert.rejects(
           async () => verifyVisitorSessionsSchema(conn),
-          /must not be a generated column/
+          /column accepted_at on visitor_sessions must not be a generated column/
         );
-        await conn.query('ALTER TABLE visitor_sessions MODIFY vehicle_id INT UNSIGNED NOT NULL');
-        await conn.query('ALTER TABLE visitor_sessions ADD CONSTRAINT fk_visitor_sessions_vehicle_id FOREIGN KEY (vehicle_id) REFERENCES vehicles (id) ON DELETE CASCADE');
+        await conn.query('ALTER TABLE visitor_sessions DROP COLUMN accepted_at, ADD COLUMN accepted_at TIMESTAMP NULL DEFAULT NULL AFTER expires_at');
         await verifyVisitorSessionsSchema(conn);
 
         // Column contract: invisible column rejected
-        await conn.query('ALTER TABLE visitor_sessions MODIFY credential_hash VARCHAR(64) INVISIBLE');
+        await conn.query('ALTER TABLE visitor_sessions MODIFY credential_hash VARCHAR(64) NOT NULL INVISIBLE');
         await assert.rejects(
           async () => verifyVisitorSessionsSchema(conn),
-          /must not be an invisible column|invalid credential_hash column definition/
+          /column credential_hash on visitor_sessions must not be an invisible column/
         );
-        await conn.query('ALTER TABLE visitor_sessions MODIFY credential_hash VARCHAR(64) VISIBLE');
+        await conn.query('ALTER TABLE visitor_sessions MODIFY credential_hash VARCHAR(64) NOT NULL VISIBLE');
         await verifyVisitorSessionsSchema(conn);
 
         // Index direction: descending index column rejected
