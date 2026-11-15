@@ -2,6 +2,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { Router } from 'express';
 import bcrypt from 'bcrypt';
 import rateLimit from 'express-rate-limit';
+import { wrapAsyncHandler } from '../asyncHandler.js';
 
 const SALT_ROUNDS = 12;
 const MAX_PASSWORD_BYTES = 72;
@@ -119,15 +120,15 @@ export function createAuthRouter({ pool, origins, loginLimiter, signupLimiter } 
   const signupLimit = signupLimiter || rateLimit({ windowMs: 60 * 60 * 1000, max: 5, standardHeaders: true, legacyHeaders: false, handler: jsonLimitHandler('Too many signup attempts. Please try again later.') });
   const csrf = requireCsrf(origins || []);
 
-  router.get('/csrf', (req, res) => {
+  router.get('/csrf', wrapAsyncHandler(async (req, res) => {
     if (!req.session.csrfToken) req.session.csrfToken = randomBytes(32).toString('hex');
-    req.session.save((error) => {
-      if (error) return sendError(res, error, { operation: 'csrf_session_save', requestId: req.requestId });
-      return res.json({ csrfToken: req.session.csrfToken });
+    await new Promise((resolve, reject) => {
+      req.session.save((error) => (error ? reject(error) : resolve()));
     });
-  });
+    return res.json({ csrfToken: req.session.csrfToken });
+  }));
 
-  router.post('/signup', csrf, signupLimit, async (req, res) => {
+  router.post('/signup', csrf, signupLimit, wrapAsyncHandler(async (req, res) => {
     try {
       const { name, email, password } = validateSignup(req.body);
       const [existing] = await pool.query('SELECT id FROM users WHERE email = ? LIMIT 1', [email]);
@@ -148,9 +149,9 @@ export function createAuthRouter({ pool, origins, loginLimiter, signupLimiter } 
     } catch (error) {
       return sendError(res, error, { operation: 'signup', requestId: req.requestId });
     }
-  });
+  }));
 
-  router.post('/login', csrf, loginLimit, async (req, res) => {
+  router.post('/login', csrf, loginLimit, wrapAsyncHandler(async (req, res) => {
     try {
       const { email, password } = validateLogin(req.body);
       const [rows] = await pool.query('SELECT id, full_name, email, password_hash, created_at FROM users WHERE email = ? LIMIT 1', [email]);
@@ -162,29 +163,32 @@ export function createAuthRouter({ pool, origins, loginLimiter, signupLimiter } 
     } catch (error) {
       return sendError(res, error, { operation: 'login', requestId: req.requestId });
     }
-  });
+  }));
 
-  router.get('/me', async (req, res) => {
+  router.get('/me', wrapAsyncHandler(async (req, res) => {
     try {
       if (!req.session.userId) return res.status(401).json({ message: 'Not authenticated' });
       const [rows] = await pool.query('SELECT id, full_name, email, created_at FROM users WHERE id = ?', [req.session.userId]);
       if (!rows.length) {
-        return req.session.destroy((error) => error ? sendError(res, error, { operation: 'me_session_destroy', requestId: req.requestId }) : res.status(401).json({ message: 'User not found' }));
+        await new Promise((resolve, reject) => {
+          req.session.destroy((error) => (error ? reject(error) : resolve()));
+        });
+        return res.status(401).json({ message: 'User not found' });
       }
       return res.status(200).json({ user: userDTO(rows[0]) });
     } catch (error) {
       return sendError(res, error, { operation: 'me', requestId: req.requestId });
     }
-  });
+  }));
 
-  router.post('/logout', csrf, (req, res) => {
+  router.post('/logout', csrf, wrapAsyncHandler(async (req, res) => {
     if (!req.session) return res.status(200).json({ message: 'Logged out' });
-    req.session.destroy((error) => {
-      if (error) return sendError(res, error, { operation: 'logout_session_destroy', requestId: req.requestId });
-      res.clearCookie('parkx.sid', { path: '/' });
-      return res.status(200).json({ message: 'Logged out' });
+    await new Promise((resolve, reject) => {
+      req.session.destroy((error) => (error ? reject(error) : resolve()));
     });
-  });
+    res.clearCookie('parkx.sid', { path: '/' });
+    return res.status(200).json({ message: 'Logged out' });
+  }));
 
   return router;
 }

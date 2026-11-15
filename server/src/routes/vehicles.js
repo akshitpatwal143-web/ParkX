@@ -1,5 +1,7 @@
 import { randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 import { Router } from 'express';
+import { sanitizeDbErrorCode } from '../db.js';
+import { wrapAsyncHandler } from '../asyncHandler.js';
 
 const ALLOWED_VEHICLE_TYPES = new Set(['car', 'suv', 'ev', 'motorcycle', 'truck', 'van', 'other']);
 const MAX_REGISTRATION_RAW_LENGTH = 50;
@@ -15,13 +17,18 @@ function apiError(status, message, errors) {
 
 function sendError(res, error, logger = console) {
   const status = error.status || 500;
-  const message = status >= 500 ? 'Internal server error' : error.publicMessage || error.message;
+  const message = status >= 500 ? 'Internal server error' : error.publicMessage || 'Internal server error';
   if (status >= 500) {
-    logger.error('Vehicle request failed', {
-      code: error.code || 'INTERNAL_ERROR',
-      errno: error.errno,
+    const safeCode = sanitizeDbErrorCode(error?.code);
+    const meta = {
+      code: safeCode,
       status,
-    });
+    };
+    if (typeof error?.errno === 'number' && Number.isSafeInteger(error.errno) && error.errno > 0 && error.errno < 65535) {
+      meta.errno = error.errno;
+    }
+    const logFn = typeof logger?.error === 'function' ? logger.error.bind(logger) : console.error;
+    logFn('Vehicle request failed', meta);
   }
   const body = { message };
   if (error.validationErrors) body.errors = error.validationErrors;
@@ -109,6 +116,29 @@ function vehicleDTO(row, qrCode = null) {
   return dto;
 }
 
+const SESSION_ID_REGEX = /^vs_[0-9a-fA-F]{40,64}$/;
+
+function ownerSessionDTO(row) {
+  const isPastExpiry = row.status !== 'closed' && new Date(row.expires_at).getTime() <= Date.now();
+  const effectiveStatus = isPastExpiry ? 'expired' : row.status;
+  return {
+    sessionId: row.public_id,
+    vehicleId: row.vehicle_id,
+    status: effectiveStatus,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    acceptedAt: row.accepted_at,
+    closedAt: row.closed_at,
+    vehicle: {
+      id: row.vehicle_id,
+      registrationNumber: row.registration_number,
+      vehicleType: row.vehicle_type,
+      vehicleModel: row.vehicle_model,
+      color: row.color,
+    },
+  };
+}
+
 function generateSecureToken() {
   const rawToken = 'pkx_' + randomBytes(32).toString('hex');
   const tokenHash = createHash('sha256').update(rawToken).digest('hex');
@@ -154,7 +184,7 @@ export function createVehiclesRouter({ pool, origins, logger = console } = {}) {
   // ────────────────────────────────────────────────────────────
   // GET /api/vehicles — List authenticated owner's vehicles
   // ────────────────────────────────────────────────────────────
-  router.get('/', async (req, res) => {
+  router.get('/', wrapAsyncHandler(async (req, res) => {
     try {
       const userId = req.session.userId;
       const [rows] = await pool.query(
@@ -181,12 +211,12 @@ export function createVehiclesRouter({ pool, origins, logger = console } = {}) {
     } catch (error) {
       return sendError(res, error, logger);
     }
-  });
+  }));
 
   // ────────────────────────────────────────────────────────────
   // POST /api/vehicles — Register a new vehicle
   // ────────────────────────────────────────────────────────────
-  router.post('/', csrf, async (req, res) => {
+  router.post('/', csrf, wrapAsyncHandler(async (req, res) => {
     let connection;
     try {
       const userId = req.session.userId;
@@ -256,12 +286,210 @@ export function createVehiclesRouter({ pool, origins, logger = console } = {}) {
     } finally {
       if (connection) connection.release();
     }
-  });
+  }));
+
+  // ────────────────────────────────────────────────────────────
+  // GET /api/vehicles/sessions — List incoming visitor contact sessions
+  // ────────────────────────────────────────────────────────────
+  router.get('/sessions', wrapAsyncHandler(async (req, res) => {
+    try {
+      const userId = req.session.userId;
+      const vehicleIdFilter = req.query.vehicleId ? Number(req.query.vehicleId) : null;
+      const statusFilter = typeof req.query.status === 'string' ? req.query.status.trim() : null;
+
+      let query = `
+        SELECT s.id, s.public_id, s.vehicle_id, s.status, s.created_at, s.expires_at, s.accepted_at, s.closed_at,
+               v.registration_number, v.vehicle_type, v.vehicle_model, v.color
+        FROM visitor_sessions s
+        JOIN vehicles v ON v.id = s.vehicle_id
+        WHERE v.user_id = ?
+      `;
+      const params = [userId];
+
+      if (vehicleIdFilter && Number.isInteger(vehicleIdFilter) && vehicleIdFilter > 0) {
+        query += ' AND s.vehicle_id = ?';
+        params.push(vehicleIdFilter);
+      }
+      if (statusFilter && ['pending', 'accepted', 'closed', 'expired'].includes(statusFilter)) {
+        query += ' AND s.status = ?';
+        params.push(statusFilter);
+      }
+
+      query += ' ORDER BY s.created_at DESC LIMIT 100';
+
+      const [rows] = await pool.query(query, params);
+      return res.json({ sessions: rows.map(ownerSessionDTO) });
+    } catch (error) {
+      return sendError(res, error, logger);
+    }
+  }));
+
+  // ────────────────────────────────────────────────────────────
+  // POST /api/vehicles/sessions/:sessionId/accept — Accept visitor request
+  // ────────────────────────────────────────────────────────────
+  router.post('/sessions/:sessionId/accept', csrf, wrapAsyncHandler(async (req, res) => {
+    try {
+      const userId = req.session.userId;
+      const sessionId = req.params.sessionId;
+      if (!sessionId || !SESSION_ID_REGEX.test(sessionId)) {
+        return res.status(400).json({ message: 'Invalid session ID format' });
+      }
+
+      const now = new Date();
+
+      // Atomic conditional update with ownership join:
+      // Accepts only currently pending, unexpired sessions for vehicles owned by this user
+      const [updateResult] = await pool.query(
+        `UPDATE visitor_sessions s
+         JOIN vehicles v ON v.id = s.vehicle_id
+         SET s.status = 'accepted', s.accepted_at = ?
+         WHERE s.public_id = ?
+           AND v.user_id = ?
+           AND s.status = 'pending'
+           AND s.expires_at > ?`,
+        [now, sessionId, userId, now]
+      );
+
+      if (updateResult?.affectedRows === 1) {
+        return res.json({
+          status: 'accepted',
+          sessionId,
+          acceptedAt: now.toISOString(),
+        });
+      }
+
+      // If affectedRows === 0, investigate current persisted state preserving strict ownership check
+      const [rows] = await pool.query(
+        `SELECT s.id, s.public_id, s.status, s.expires_at, s.accepted_at, s.closed_at
+         FROM visitor_sessions s
+         JOIN vehicles v ON v.id = s.vehicle_id
+         WHERE s.public_id = ? AND v.user_id = ?
+         LIMIT 1`,
+        [sessionId, userId]
+      );
+
+      if (!rows.length) {
+        return res.status(404).json({ message: 'Contact session not found' });
+      }
+
+      const session = rows[0];
+
+      if (session.status === 'accepted') {
+        return res.json({
+          status: 'accepted',
+          sessionId: session.public_id,
+          message: 'Session is already accepted',
+          acceptedAt: session.accepted_at,
+        });
+      }
+
+      if (session.status === 'closed') {
+        return res.status(400).json({ status: 'closed', message: 'Cannot accept a closed session' });
+      }
+
+      const isPastExpiry = new Date(session.expires_at).getTime() <= now.getTime();
+      if (isPastExpiry || session.status === 'expired') {
+        if (session.status !== 'expired') {
+          await pool.query(
+            `UPDATE visitor_sessions SET status = 'expired' WHERE id = ? AND status != 'closed'`,
+            [session.id]
+          );
+        }
+        return res.status(400).json({ status: 'expired', message: 'Cannot accept an expired session' });
+      }
+
+      return res.status(400).json({
+        status: session.status,
+        message: 'Session cannot be accepted in its current state',
+      });
+    } catch (error) {
+      return sendError(res, error, logger);
+    }
+  }));
+
+  // ────────────────────────────────────────────────────────────
+  // POST /api/vehicles/sessions/:sessionId/close — Owner closes session
+  // ────────────────────────────────────────────────────────────
+  router.post('/sessions/:sessionId/close', csrf, wrapAsyncHandler(async (req, res) => {
+    try {
+      const userId = req.session.userId;
+      const sessionId = req.params.sessionId;
+      if (!sessionId || !SESSION_ID_REGEX.test(sessionId)) {
+        return res.status(400).json({ message: 'Invalid session ID format' });
+      }
+
+      const now = new Date();
+
+      // Atomic conditional update with ownership join:
+      // Closes only currently pending or accepted unexpired sessions for vehicles owned by this user
+      const [updateResult] = await pool.query(
+        `UPDATE visitor_sessions s
+         JOIN vehicles v ON v.id = s.vehicle_id
+         SET s.status = 'closed', s.closed_at = ?
+         WHERE s.public_id = ?
+           AND v.user_id = ?
+           AND s.status IN ('pending', 'accepted')
+           AND s.expires_at > ?`,
+        [now, sessionId, userId, now]
+      );
+
+      if (updateResult?.affectedRows === 1) {
+        return res.json({
+          status: 'closed',
+          sessionId,
+          closedAt: now.toISOString(),
+        });
+      }
+
+      // If affectedRows === 0, investigate current persisted state preserving strict ownership check
+      const [rows] = await pool.query(
+        `SELECT s.id, s.public_id, s.status, s.expires_at, s.closed_at
+         FROM visitor_sessions s
+         JOIN vehicles v ON v.id = s.vehicle_id
+         WHERE s.public_id = ? AND v.user_id = ?
+         LIMIT 1`,
+        [sessionId, userId]
+      );
+
+      if (!rows.length) {
+        return res.status(404).json({ message: 'Contact session not found' });
+      }
+
+      const session = rows[0];
+
+      if (session.status === 'closed') {
+        return res.json({
+          status: 'closed',
+          sessionId: session.public_id,
+          message: 'Session is already closed',
+          closedAt: session.closed_at,
+        });
+      }
+
+      const isPastExpiry = new Date(session.expires_at).getTime() <= now.getTime();
+      if (isPastExpiry || session.status === 'expired') {
+        if (session.status !== 'expired') {
+          await pool.query(
+            `UPDATE visitor_sessions SET status = 'expired' WHERE id = ? AND status != 'closed'`,
+            [session.id]
+          );
+        }
+        return res.status(400).json({ status: 'expired', message: 'Session has already expired and cannot be closed' });
+      }
+
+      return res.status(400).json({
+        status: session.status,
+        message: 'Session cannot be closed in its current state',
+      });
+    } catch (error) {
+      return sendError(res, error, logger);
+    }
+  }));
 
   // ────────────────────────────────────────────────────────────
   // GET /api/vehicles/:id — Retrieve vehicle details
   // ────────────────────────────────────────────────────────────
-  router.get('/:id', async (req, res) => {
+  router.get('/:id', wrapAsyncHandler(async (req, res) => {
     try {
       const userId = req.session.userId;
       const vehicleId = Number(req.params.id);
@@ -294,12 +522,48 @@ export function createVehiclesRouter({ pool, origins, logger = console } = {}) {
     } catch (error) {
       return sendError(res, error, logger);
     }
-  });
+  }));
+
+  // ────────────────────────────────────────────────────────────
+  // GET /api/vehicles/:id/sessions — Retrieve vehicle contact sessions
+  // ────────────────────────────────────────────────────────────
+  router.get('/:id/sessions', wrapAsyncHandler(async (req, res) => {
+    try {
+      const userId = req.session.userId;
+      const vehicleId = Number(req.params.id);
+      if (!Number.isInteger(vehicleId) || vehicleId <= 0) {
+        return res.status(400).json({ message: 'Invalid vehicle ID' });
+      }
+
+      // Check ownership
+      const [vRows] = await pool.query(
+        'SELECT id FROM vehicles WHERE id = ? AND user_id = ? LIMIT 1',
+        [vehicleId, userId]
+      );
+      if (!vRows.length) {
+        return res.status(404).json({ message: 'Vehicle not found' });
+      }
+
+      const [rows] = await pool.query(
+        `SELECT s.id, s.public_id, s.vehicle_id, s.status, s.created_at, s.expires_at, s.accepted_at, s.closed_at,
+                v.registration_number, v.vehicle_type, v.vehicle_model, v.color
+         FROM visitor_sessions s
+         JOIN vehicles v ON v.id = s.vehicle_id
+         WHERE s.vehicle_id = ? AND v.user_id = ?
+         ORDER BY s.created_at DESC LIMIT 50`,
+        [vehicleId, userId]
+      );
+
+      return res.json({ sessions: rows.map(ownerSessionDTO) });
+    } catch (error) {
+      return sendError(res, error, logger);
+    }
+  }));
 
   // ────────────────────────────────────────────────────────────
   // PATCH /api/vehicles/:id — Update vehicle information
   // ────────────────────────────────────────────────────────────
-  router.patch('/:id', csrf, async (req, res) => {
+  router.patch('/:id', csrf, wrapAsyncHandler(async (req, res) => {
     try {
       const userId = req.session.userId;
       const vehicleId = Number(req.params.id);
@@ -358,12 +622,12 @@ export function createVehiclesRouter({ pool, origins, logger = console } = {}) {
     } catch (error) {
       return sendError(res, error, logger);
     }
-  });
+  }));
 
   // ────────────────────────────────────────────────────────────
   // DELETE /api/vehicles/:id — Remove a vehicle
   // ────────────────────────────────────────────────────────────
-  router.delete('/:id', csrf, async (req, res) => {
+  router.delete('/:id', csrf, wrapAsyncHandler(async (req, res) => {
     let connection;
     try {
       const userId = req.session.userId;
@@ -399,12 +663,12 @@ export function createVehiclesRouter({ pool, origins, logger = console } = {}) {
     } finally {
       if (connection) connection.release();
     }
-  });
+  }));
 
   // ────────────────────────────────────────────────────────────
   // POST /api/vehicles/:id/qr/rotate — Regenerate / Rotate QR code
   // ────────────────────────────────────────────────────────────
-  router.post('/:id/qr/rotate', csrf, async (req, res) => {
+  router.post('/:id/qr/rotate', csrf, wrapAsyncHandler(async (req, res) => {
     const userId = req.session.userId;
     const vehicleId = Number(req.params.id);
     if (!Number.isInteger(vehicleId) || vehicleId <= 0) {
@@ -467,7 +731,7 @@ export function createVehiclesRouter({ pool, origins, logger = console } = {}) {
       }
     }
     return res.status(409).json({ message: 'QR rotation conflicted with another update. Please retry.' });
-  });
+  }));
 
   return router;
 }

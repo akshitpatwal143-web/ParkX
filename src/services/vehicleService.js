@@ -80,3 +80,48 @@ export async function rotateQrCode(id) {
   });
   return readResponse(res, 'Failed to rotate QR code');
 }
+
+export async function fetchOwnerSessions({ vehicleId, status } = {}) {
+  const params = new URLSearchParams();
+  if (vehicleId) params.set('vehicleId', vehicleId);
+  if (status) params.set('status', status);
+  const qs = params.toString() ? `?${params.toString()}` : '';
+
+  const res = await fetch(`${API_BASE}/sessions${qs}`, {
+    method: 'GET',
+    credentials: 'include',
+  });
+  return readResponse(res, 'Failed to fetch contact sessions');
+}
+
+export async function fetchVehicleSessions(vehicleId) {
+  const res = await fetch(`${API_BASE}/${vehicleId}/sessions`, {
+    method: 'GET',
+    credentials: 'include',
+  });
+  return readResponse(res, 'Failed to fetch vehicle contact sessions');
+}
+
+export async function acceptVisitorSession(sessionId) {
+  const token = await csrfToken();
+  const res = await fetch(`${API_BASE}/sessions/${encodeURIComponent(sessionId)}/accept`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'X-CSRF-Token': token,
+    },
+  });
+  return readResponse(res, 'Failed to accept contact session');
+}
+
+export async function closeOwnerVisitorSession(sessionId) {
+  const token = await csrfToken();
+  const res = await fetch(`${API_BASE}/sessions/${encodeURIComponent(sessionId)}/close`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'X-CSRF-Token': token,
+    },
+  });
+  return readResponse(res, 'Failed to close contact session');
+}
