@@ -15,12 +15,16 @@ import {
   Clock,
   Loader2,
   XCircle,
+  Send,
+  AlertCircle,
 } from 'lucide-react';
 import {
   verifyPublicToken,
   createVisitorSession,
   getVisitorSession,
   closeVisitorSession,
+  sendVisitorMessage,
+  fetchVisitorMessages,
   getStoredVisitorSession,
   saveStoredVisitorSession,
   clearStoredVisitorSession,
@@ -41,12 +45,22 @@ export default function PublicVehicleView({ token, onNavigateHome }) {
   const [sessionLoading, setSessionLoading] = useState(false);
   const [sessionError, setSessionError] = useState('');
 
+  // Visitor messaging state (Phase 3.3)
+  const [messages, setMessages] = useState([]);
+  const [messageText, setMessageText] = useState('');
+  const [messageSending, setMessageSending] = useState(false);
+  const [messageError, setMessageError] = useState('');
+  const [messagesLoading, setMessagesLoading] = useState(false);
+
   // Request lifecycle management refs to prevent stale asynchronous response overwrites
   const abortControllerRef = useRef(null);
   const activeTokenRef = useRef(token);
   const requestGenRef = useRef(0);
   const pollingAbortRef = useRef(null);
   const pollingGenRef = useRef(0);
+  const messagesEndRef = useRef(null);
+  const latestMessageIdRef = useRef(0);
+  const messagePollingAbortRef = useRef(null);
 
   // Synchronously compute effective view state during render:
   // If stored verification token does not match the current token prop,
@@ -61,6 +75,7 @@ export default function PublicVehicleView({ token, onNavigateHome }) {
     : verificationState.message;
   const effectiveVisitorConfirmed = isTokenStale ? false : visitorConfirmed;
   const effectiveVisitorSession = isTokenStale ? null : visitorSession;
+  const effectiveMessages = isTokenStale ? [] : messages;
 
   // Set Referrer-Policy to no-referrer dynamically
   useEffect(() => {
@@ -338,6 +353,157 @@ export default function PublicVehicleView({ token, onNavigateHome }) {
     }
   };
 
+  const scrollToBottom = () => {
+    if (messagesEndRef.current && typeof messagesEndRef.current.scrollIntoView === 'function') {
+      messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  };
+
+  // Initial fetch of messages when visitorSession becomes active
+  useEffect(() => {
+    if (!visitorSession?.sessionId || !visitorSession?.visitorCredential) {
+      setMessages([]);
+      latestMessageIdRef.current = 0;
+      return;
+    }
+
+    let active = true;
+    const fetchInitial = async () => {
+      setMessagesLoading(true);
+      try {
+        const res = await fetchVisitorMessages(visitorSession.sessionId, visitorSession.visitorCredential, { limit: 100 });
+        if (!active) return;
+        if (res.status === 'ok' && Array.isArray(res.messages)) {
+          setMessages(res.messages);
+          if (res.messages.length > 0) {
+            latestMessageIdRef.current = Math.max(...res.messages.map((m) => Number(m.id) || 0));
+          }
+        }
+      } catch {
+        // Silently catch initial load errors
+      } finally {
+        if (active) setMessagesLoading(false);
+      }
+    };
+
+    fetchInitial();
+
+    return () => {
+      active = false;
+    };
+  }, [visitorSession?.sessionId, visitorSession?.visitorCredential]);
+
+  // Scroll to bottom when messages load or change
+  useEffect(() => {
+    if (messages.length > 0) {
+      scrollToBottom();
+    }
+  }, [messages.length]);
+
+  // Incremental polling for new messages while session is pending or accepted
+  useEffect(() => {
+    const isLive = visitorSession?.status === 'pending' || visitorSession?.status === 'accepted';
+    if (!visitorSession?.sessionId || !visitorSession?.visitorCredential || !isLive) {
+      if (messagePollingAbortRef.current) {
+        messagePollingAbortRef.current.abort();
+        messagePollingAbortRef.current = null;
+      }
+      return;
+    }
+
+    const targetSessionId = visitorSession.sessionId;
+    const targetCredential = visitorSession.visitorCredential;
+
+    const interval = setInterval(async () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        return;
+      }
+
+      if (messagePollingAbortRef.current) {
+        messagePollingAbortRef.current.abort();
+      }
+
+      const controller = new AbortController();
+      messagePollingAbortRef.current = controller;
+
+      try {
+        const afterId = latestMessageIdRef.current;
+        const res = await fetchVisitorMessages(targetSessionId, targetCredential, {
+          after: afterId,
+          limit: 50,
+          signal: controller.signal,
+        });
+
+        if (controller.signal.aborted) return;
+
+        if (res.status === 'ok' && Array.isArray(res.messages) && res.messages.length > 0) {
+          setMessages((prev) => {
+            const existingIds = new Set(prev.map((m) => m.id));
+            const fresh = res.messages.filter((m) => !existingIds.has(m.id));
+            if (fresh.length === 0) return prev;
+            const updated = [...prev, ...fresh];
+            latestMessageIdRef.current = Math.max(...updated.map((m) => Number(m.id) || 0));
+            return updated;
+          });
+          scrollToBottom();
+        }
+      } catch {
+        // Silently catch polling aborts
+      }
+    }, 4000);
+
+    return () => {
+      clearInterval(interval);
+      if (messagePollingAbortRef.current) {
+        messagePollingAbortRef.current.abort();
+        messagePollingAbortRef.current = null;
+      }
+    };
+  }, [visitorSession?.sessionId, visitorSession?.visitorCredential, visitorSession?.status]);
+
+  const handleSendMessage = async (e) => {
+    e?.preventDefault();
+    const trimmed = messageText.trim();
+    if (!trimmed || messageSending || !visitorSession?.sessionId || !visitorSession?.visitorCredential) return;
+
+    setMessageSending(true);
+    setMessageError('');
+
+    const clientMsgId = `cm_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+
+    try {
+      const res = await sendVisitorMessage(
+        visitorSession.sessionId,
+        visitorSession.visitorCredential,
+        trimmed,
+        clientMsgId
+      );
+
+      if (res.status === 'sent' && res.message) {
+        setMessageText('');
+        setMessages((prev) => {
+          if (prev.some((m) => m.id === res.message.id || (m.clientMessageId && m.clientMessageId === clientMsgId))) {
+            return prev;
+          }
+          const updated = [...prev, res.message];
+          latestMessageIdRef.current = Math.max(latestMessageIdRef.current, Number(res.message.id) || 0);
+          return updated;
+        });
+        scrollToBottom();
+      } else if (res.status === 'closed' || res.status === 'expired') {
+        setVisitorSession((prev) => (prev ? { ...prev, status: res.status } : prev));
+        setMessageError(typeof res.message === 'string' ? res.message : `Session is ${res.status}.`);
+      } else {
+        const errorText = typeof res.message === 'string' ? res.message : (typeof res.error === 'string' ? res.error : 'Failed to send message.');
+        setMessageError(errorText);
+      }
+    } catch (err) {
+      setMessageError(err?.message && typeof err.message === 'string' ? err.message : 'Unable to send message.');
+    } finally {
+      setMessageSending(false);
+    }
+  };
+
   return (
     <div className="relative min-h-[calc(100vh-80px)] pt-24 pb-20 px-6 md:px-12 max-w-2xl mx-auto flex flex-col justify-center">
       {/* ────────────────────────────────────────────── */}
@@ -493,7 +659,7 @@ export default function PublicVehicleView({ token, onNavigateHome }) {
                 <div className="text-xs font-mono text-neutral-300 space-y-2 leading-relaxed">
                   {effectiveVisitorSession.status === 'pending' && (
                     <p>
-                      Your contact notification has been dispatched to the vehicle owner. Waiting for owner acknowledgment...
+                      Your contact notification has been dispatched to the vehicle owner. Your message has been sent. The owner can respond when available.
                     </p>
                   )}
                   {effectiveVisitorSession.status === 'accepted' && (
@@ -512,6 +678,95 @@ export default function PublicVehicleView({ token, onNavigateHome }) {
                     </p>
                   )}
                 </div>
+
+                {/* Conversation Message List (Phase 3.3) */}
+                <div
+                  role="region"
+                  aria-label="Conversation messages"
+                  className="rounded-xl border border-white/[0.08] bg-black/40 p-3.5 space-y-3 max-h-64 overflow-y-auto"
+                >
+                  {messagesLoading && effectiveMessages.length === 0 ? (
+                    <div className="py-8 text-center flex flex-col items-center justify-center space-y-2">
+                      <Loader2 className="w-5 h-5 text-[#2ee6ca] animate-spin" />
+                      <span className="text-[11px] font-mono text-neutral-400">Loading conversation...</span>
+                    </div>
+                  ) : effectiveMessages.length === 0 ? (
+                    <div className="py-6 text-center space-y-1">
+                      <MessageSquare className="w-6 h-6 text-neutral-600 mx-auto" />
+                      <p className="text-xs font-mono text-neutral-400">No messages yet.</p>
+                      <p className="text-[10px] font-mono text-neutral-500">
+                        Type a message below to alert the vehicle owner.
+                      </p>
+                    </div>
+                  ) : (
+                    effectiveMessages.map((m) => {
+                      const isVisitor = m.senderType === 'visitor';
+                      return (
+                        <div
+                          key={m.id || m.clientMessageId}
+                          className={`flex flex-col ${isVisitor ? 'items-end' : 'items-start'}`}
+                        >
+                          <div className="flex items-center space-x-1.5 pb-0.5 px-1 text-[10px] font-mono text-neutral-400">
+                            <span className="font-semibold text-neutral-300">
+                              {isVisitor ? 'You' : 'Vehicle Owner'}
+                            </span>
+                            <span>•</span>
+                            <span>{new Date(m.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                          </div>
+                          <div
+                            className={`max-w-[85%] rounded-2xl px-3.5 py-2 text-xs font-mono leading-relaxed break-words whitespace-pre-wrap ${
+                              isVisitor
+                                ? 'bg-[#2ee6ca]/15 border border-[#2ee6ca]/40 text-[#2ee6ca]'
+                                : 'bg-white/[0.06] border border-white/[0.1] text-neutral-200'
+                            }`}
+                          >
+                            {m.body}
+                          </div>
+                        </div>
+                      );
+                    })
+                  )}
+                  <div ref={messagesEndRef} />
+                </div>
+
+                {/* Message Input Box (Phase 3.3) */}
+                {(effectiveVisitorSession.status === 'pending' || effectiveVisitorSession.status === 'accepted') ? (
+                  <form onSubmit={handleSendMessage} className="space-y-2">
+                    {messageError && (
+                      <div className="p-2.5 rounded-lg border border-red-500/30 bg-red-500/10 text-red-400 text-xs font-mono flex items-center space-x-2">
+                        <AlertCircle className="w-4 h-4 shrink-0" />
+                        <span className="truncate">{messageError}</span>
+                      </div>
+                    )}
+                    <div className="flex items-center space-x-2">
+                      <input
+                        type="text"
+                        value={messageText}
+                        onChange={(e) => setMessageText(e.target.value)}
+                        placeholder="Type a message for the vehicle owner..."
+                        maxLength={2000}
+                        disabled={messageSending}
+                        className="flex-1 bg-black/60 border border-white/[0.1] focus:border-[#2ee6ca]/60 focus:outline-none rounded-xl px-3.5 py-2 text-xs font-mono text-white placeholder-neutral-500 transition-colors"
+                      />
+                      <button
+                        type="submit"
+                        disabled={!messageText.trim() || messageSending}
+                        className="px-3.5 py-2 rounded-xl bg-[#2ee6ca] hover:bg-[#28d1b7] text-black font-mono font-semibold text-xs uppercase tracking-wider flex items-center space-x-1.5 transition-all disabled:opacity-40 disabled:cursor-not-allowed shadow-[0_0_15px_rgba(46,230,202,0.2)]"
+                      >
+                        {messageSending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+                        <span>Send</span>
+                      </button>
+                    </div>
+                    <div className="flex justify-between items-center text-[10px] font-mono text-neutral-500 px-1">
+                      <span>{messageText.length} / 2000</span>
+                      <span>Press Enter to send message</span>
+                    </div>
+                  </form>
+                ) : (
+                  <div className="p-2.5 text-center rounded-lg border border-white/[0.06] bg-black/30 text-neutral-400 text-xs font-mono">
+                    This contact session is {effectiveVisitorSession.status}. No further messages can be sent.
+                  </div>
+                )}
 
                 {effectiveVisitorSession.expiresAt && (
                   <div className="flex items-center space-x-1.5 text-[10px] font-mono text-neutral-500 pt-1">

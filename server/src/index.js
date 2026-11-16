@@ -26,6 +26,7 @@ import { DatabaseTracker, instrumentPool, isInstrumentedPool, getInstrumentedPoo
 import { createAuthRouter } from './routes/auth.js';
 import { createVehiclesRouter } from './routes/vehicles.js';
 import { createPublicRouter } from './routes/public.js';
+import { createNotificationsRouter } from './routes/notifications.js';
 import { startVisitorSessionCleanupTask } from './services/sessionCleanup.js';
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -235,6 +236,7 @@ export function createApp({
     sessionReadLimiter,
     logger: activeLogger,
   }));
+  app.use('/api/notifications', createNotificationsRouter({ pool: instrumentedPool, origins, logger: activeLogger }));
   app.get('/api/health', wrapAsyncHandler(async (_req, res) => {
     const safeLog = (level, message, meta) => {
       try {

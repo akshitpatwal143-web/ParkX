@@ -1,13 +1,39 @@
 import React, { useState, useEffect } from 'react';
-import { LogIn, Rocket, Menu, X, User as UserIcon, LogOut, Car, Compass } from 'lucide-react';
+import { LogIn, Rocket, Menu, X, User as UserIcon, LogOut, Car, Compass, Bell, MessageSquare } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { getAuthStatus } from '../context/authStatus';
+import { fetchNotifications } from '../services/vehicleService';
 
 export default function Navbar({ currentView = 'landing', onNavigateView }) {
   const [scrolled, setScrolled] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [notificationData, setNotificationData] = useState({ totalUnreadCount: 0, sessions: [] });
   const { openLogin, openSignup, user, logout, isInitializing, authError } = useAuth();
   const authStatus = getAuthStatus(isInitializing, authError);
+
+  const loadNotifications = async () => {
+    if (!user) return;
+    try {
+      const data = await fetchNotifications();
+      if (data && typeof data.totalUnreadCount === 'number') {
+        setNotificationData(data);
+      }
+    } catch {}
+  };
+
+  useEffect(() => {
+    if (user) {
+      loadNotifications();
+      const interval = setInterval(() => {
+        if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+        loadNotifications();
+      }, 15000);
+      return () => clearInterval(interval);
+    } else {
+      setNotificationData({ totalUnreadCount: 0, sessions: [] });
+    }
+  }, [user]);
 
   useEffect(() => {
     const handleScroll = () => {
@@ -119,6 +145,76 @@ export default function Navbar({ currentView = 'landing', onNavigateView }) {
                 <Car className="w-3.5 h-3.5" />
                 <span>My Garage</span>
               </button>
+
+              {/* Notification Bell Dropdown (Phase 3.4) */}
+              <div className="relative">
+                <button
+                  onClick={() => setNotificationsOpen((prev) => !prev)}
+                  className={`relative p-2 rounded-lg border text-xs font-mono transition-all ${
+                    notificationsOpen
+                      ? 'border-[#2ee6ca] bg-[#2ee6ca]/10 text-[#2ee6ca]'
+                      : 'border-white/[0.08] bg-white/[0.02] text-neutral-400 hover:text-white hover:border-white/20'
+                  }`}
+                  title="Notifications"
+                  aria-label="View notifications"
+                >
+                  <Bell className="w-4 h-4" />
+                  {Number(notificationData.totalUnreadCount || 0) > 0 && (
+                    <span className="absolute -top-1 -right-1 px-1.5 py-0.2 rounded-full bg-[#2ee6ca] text-black text-[9px] font-bold animate-pulse">
+                      {notificationData.totalUnreadCount}
+                    </span>
+                  )}
+                </button>
+
+                {notificationsOpen && (
+                  <div className="absolute right-0 mt-2 w-80 rounded-xl border border-white/[0.1] bg-[#0c0c0c]/95 backdrop-blur-xl shadow-2xl p-3 z-50 space-y-2 text-xs font-mono">
+                    <div className="flex items-center justify-between pb-2 border-b border-white/[0.06]">
+                      <span className="font-semibold text-white uppercase tracking-wider text-[11px]">
+                        Notifications {Number(notificationData.totalUnreadCount || 0) > 0 ? `(${notificationData.totalUnreadCount})` : ''}
+                      </span>
+                      <button
+                        onClick={() => setNotificationsOpen(false)}
+                        className="text-neutral-500 hover:text-white"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+
+                    {Number(notificationData.totalUnreadCount || 0) === 0 ? (
+                      <div className="py-6 text-center text-neutral-500 text-[11px]">
+                        No unread notifications
+                      </div>
+                    ) : (
+                      <div className="max-h-60 overflow-y-auto space-y-1.5 divide-y divide-white/[0.04]">
+                        {notificationData.sessions.map((item) => (
+                          <button
+                            key={item.sessionId}
+                            onClick={() => {
+                              setNotificationsOpen(false);
+                              if (onNavigateView) {
+                                onNavigateView('garage', { openSessionId: item.sessionId });
+                              }
+                            }}
+                            className="w-full text-left p-2 rounded-lg hover:bg-white/[0.04] transition-colors group flex items-start justify-between gap-2 pt-2"
+                          >
+                            <div className="space-y-0.5">
+                              <div className="text-white font-semibold group-hover:text-[#2ee6ca] transition-colors uppercase">
+                                {item.vehicleModel || 'Vehicle'} ({item.registrationNumber})
+                              </div>
+                              <div className="text-[10px] text-neutral-400">
+                                {item.lastMessageAt ? new Date(item.lastMessageAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'New message'}
+                              </div>
+                            </div>
+                            <span className="px-1.5 py-0.5 rounded-full bg-[#2ee6ca] text-black font-bold text-[9px] shrink-0">
+                              {item.unreadCount} new
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
             </div>
           )}
 
@@ -221,6 +317,24 @@ export default function Navbar({ currentView = 'landing', onNavigateView }) {
                 <span>My Garage</span>
               </button>
             </div>
+          )}
+
+          {user && Number(notificationData.totalUnreadCount || 0) > 0 && (
+            <button
+              onClick={() => {
+                setMobileOpen(false);
+                if (onNavigateView) onNavigateView('garage');
+              }}
+              className="w-full flex items-center justify-between px-3 py-2 rounded-lg border border-[#2ee6ca]/30 bg-[#2ee6ca]/10 text-white text-xs font-mono uppercase"
+            >
+              <div className="flex items-center space-x-2">
+                <Bell className="w-4 h-4 text-[#2ee6ca]" />
+                <span>Unread Notifications</span>
+              </div>
+              <span className="px-1.5 py-0.5 rounded-full bg-[#2ee6ca] text-black font-bold text-[10px]">
+                {notificationData.totalUnreadCount}
+              </span>
+            </button>
           )}
 
           {isInitializing ? null : user ? (

@@ -272,3 +272,127 @@ export async function closeVisitorSession(sessionId, credential, { signal } = {}
     return { status: 'unavailable', message: 'Unable to close session due to network error.' };
   }
 }
+
+// ────────────────────────────────────────────────────────────
+// Visitor Messaging (Phase 3.3)
+// ────────────────────────────────────────────────────────────
+
+export async function sendVisitorMessage(sessionId, credential, body, clientMessageId = null, { signal } = {}) {
+  if (!sessionId || !credential) {
+    return { status: 'invalid', message: 'Session ID and visitor credential are required.' };
+  }
+  if (!body || typeof body !== 'string' || !body.trim()) {
+    return { status: 'invalid', message: 'Message body cannot be empty.' };
+  }
+
+  try {
+    const payload = { body: body.trim() };
+    if (clientMessageId) payload.clientMessageId = clientMessageId;
+
+    const res = await fetch(`${SESSIONS_BASE}/${encodeURIComponent(sessionId)}/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'X-Visitor-Credential': credential,
+      },
+      body: JSON.stringify(payload),
+      signal,
+    });
+
+    const data = await res.json().catch(() => ({}));
+
+    if ((res.status === 201 || res.status === 200) && data.status === 'sent') {
+      return {
+        status: 'sent',
+        message: data.message,
+      };
+    }
+
+    if (res.status === 400 && (data.status === 'closed' || data.status === 'expired')) {
+      return {
+        status: data.status,
+        message: data.message || `Session is ${data.status} and cannot accept messages.`,
+      };
+    }
+
+    if (res.status === 401 || res.status === 403) {
+      return {
+        status: 'unauthorized',
+        message: data.message || 'Unauthorized session access.',
+      };
+    }
+
+    if (res.status === 429) {
+      return {
+        status: 'rate_limited',
+        message: data.message || 'Too many messages sent. Please wait a moment.',
+      };
+    }
+
+    return {
+      status: 'error',
+      message: data.message || 'Unable to send message.',
+    };
+  } catch (err) {
+    if (err?.name === 'AbortError') throw err;
+    return {
+      status: 'unavailable',
+      message: 'Unable to send message due to network error.',
+    };
+  }
+}
+
+export async function fetchVisitorMessages(sessionId, credential, { after = 0, limit = 50, signal } = {}) {
+  if (!sessionId || !credential) {
+    return { status: 'invalid', message: 'Session ID and visitor credential are required.', messages: [] };
+  }
+
+  try {
+    const params = new URLSearchParams();
+    if (after) params.append('after', String(after));
+    if (limit) params.append('limit', String(limit));
+
+    const queryStr = params.toString() ? `?${params.toString()}` : '';
+    const res = await fetch(`${SESSIONS_BASE}/${encodeURIComponent(sessionId)}/messages${queryStr}`, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        'X-Visitor-Credential': credential,
+      },
+      signal,
+    });
+
+    const data = await res.json().catch(() => ({}));
+
+    if (res.status === 200) {
+      return {
+        status: 'ok',
+        sessionId: data.sessionId,
+        messages: Array.isArray(data.messages) ? data.messages : [],
+        hasMore: Boolean(data.hasMore),
+      };
+    }
+
+    if (res.status === 401 || res.status === 403) {
+      return {
+        status: 'unauthorized',
+        message: data.message || 'Unauthorized to access messages.',
+        messages: [],
+      };
+    }
+
+    return {
+      status: 'error',
+      message: data.message || 'Unable to fetch messages.',
+      messages: [],
+    };
+  } catch (err) {
+    if (err?.name === 'AbortError') throw err;
+    return {
+      status: 'unavailable',
+      message: 'Unable to fetch messages due to network error.',
+      messages: [],
+    };
+  }
+}

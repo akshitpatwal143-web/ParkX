@@ -3,10 +3,13 @@ import { Router } from 'express';
 import rateLimit from 'express-rate-limit';
 import { sanitizeDbErrorCode } from '../db.js';
 import { wrapAsyncHandler } from '../asyncHandler.js';
+import { sendPushNotificationForSession } from '../services/pushNotification.js';
 
 const TOKEN_REGEX = /^pkx_[0-9a-fA-F]{64}$/;
 const SESSION_ID_REGEX = /^vs_[0-9a-fA-F]{40,64}$/;
 const CREDENTIAL_REGEX = /^vcred_[0-9a-fA-F]{64}$/;
+const CLIENT_MESSAGE_ID_REGEX = /^[A-Za-z0-9_-]{1,64}$/;
+const MAX_MESSAGE_LENGTH = 2000;
 const DEFAULT_SESSION_TTL_HOURS = 24;
 
 function sanitizeString(str) {
@@ -34,8 +37,10 @@ function compareHashes(hashA, hashB) {
   return timingSafeEqual(bufA, bufB);
 }
 
-export function createPublicRouter({ pool, limiter, sessionCreateLimiter, sessionReadLimiter, logger } = {}) {
+export function createPublicRouter({ pool, limiter, sessionCreateLimiter, sessionReadLimiter, messageCreateLimiter, logger, _testHook } = {}) {
   if (!pool) throw new Error('createPublicRouter requires a database pool');
+  // Defense-in-depth: test hook is strictly disabled when NODE_ENV === 'production'
+  const activeTestHook = process.env.NODE_ENV === 'production' ? null : _testHook;
   const router = Router();
 
   // Architectural Note on Rate Limiting:
@@ -88,9 +93,24 @@ export function createPublicRouter({ pool, limiter, sessionCreateLimiter, sessio
     },
   });
 
+  // Rate limiter for visitor sending messages: 60 messages per 15 minutes per IP
+  const defaultMessageLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (_req, res) => {
+      res.status(429).json({
+        status: 'rate_limited',
+        message: 'Too many messages sent. Please wait a moment before sending another.',
+      });
+    },
+  });
+
   const verifyLimiter = limiter || defaultLimiter;
   const createLimiter = sessionCreateLimiter || defaultCreateLimiter;
   const readLimiter = sessionReadLimiter || defaultReadLimiter;
+  const messageLimiter = messageCreateLimiter || defaultMessageLimiter;
 
   // ────────────────────────────────────────────────────────────
   // 1. GET /api/public/vehicles/:token — Verify QR pass telemetry
@@ -476,9 +496,446 @@ export function createPublicRouter({ pool, limiter, sessionCreateLimiter, sessio
       });
     }
 
+    let connection;
+    try {
+      connection = await pool.getConnection();
+      if (typeof activeTestHook?.onConnectionAcquired === 'function') {
+        await activeTestHook.onConnectionAcquired({
+          route: 'visitor_close',
+          sessionId,
+          connection,
+          processlistId: connection.threadId,
+        });
+      }
+      await connection.beginTransaction();
+
+      const [rows] = await connection.query(
+        `SELECT id, public_id, credential_hash, status, expires_at, closed_at
+         FROM visitor_sessions
+         WHERE public_id = ?
+         FOR UPDATE`,
+        [sessionId]
+      );
+
+      if (!rows || rows.length === 0) {
+        await connection.rollback();
+        return res.status(404).json({
+          status: 'not_found',
+          message: 'Contact session not found.',
+        });
+      }
+
+      const sessionRow = rows[0];
+
+      // Verify credential
+      const presentedHash = createHash('sha256').update(suppliedCredential).digest('hex');
+      if (!compareHashes(sessionRow.credential_hash, presentedHash)) {
+        await connection.rollback();
+        return res.status(403).json({
+          status: 'forbidden',
+          message: 'Invalid visitor credential for this session.',
+        });
+      }
+
+      // Check current state before attempting conditional update
+      if (sessionRow.status === 'closed') {
+        await connection.rollback();
+        return res.status(200).json({
+          status: 'closed',
+          message: 'Session is already closed.',
+          closedAt: sessionRow.closed_at,
+        });
+      }
+
+      const now = new Date();
+      const isPastExpiry = new Date(sessionRow.expires_at).getTime() <= now.getTime();
+      if (isPastExpiry || sessionRow.status === 'expired') {
+        if (sessionRow.status !== 'expired') {
+          await connection.query(
+            `UPDATE visitor_sessions SET status = 'expired' WHERE id = ? AND status != 'closed'`,
+            [sessionRow.id]
+          );
+          await connection.commit();
+        } else {
+          await connection.rollback();
+        }
+        return res.status(410).json({
+          status: 'expired',
+          message: 'Session has already expired and cannot be closed.',
+        });
+      }
+
+      // Atomic conditional update ensuring status is pending or accepted and not expired
+      const [updateResult] = await connection.query(
+        `UPDATE visitor_sessions
+         SET status = 'closed', closed_at = ?
+         WHERE id = ? AND status IN ('pending', 'accepted') AND expires_at > ?`,
+        [now, sessionRow.id, now]
+      );
+
+      if (updateResult?.affectedRows === 1) {
+        await connection.commit();
+        return res.status(200).json({
+          status: 'closed',
+          closedAt: now.toISOString(),
+        });
+      }
+
+      // If affectedRows === 0, state changed concurrently. Inspect persisted outcome:
+      const [refreshedRows] = await connection.query(
+        `SELECT status, expires_at, closed_at FROM visitor_sessions WHERE id = ?`,
+        [sessionRow.id]
+      );
+      const refreshed = refreshedRows[0];
+
+      if (refreshed?.status === 'closed') {
+        await connection.commit();
+        return res.status(200).json({
+          status: 'closed',
+          message: 'Session is already closed.',
+          closedAt: refreshed.closed_at,
+        });
+      }
+
+      if (refreshed?.status === 'expired' || new Date(refreshed?.expires_at).getTime() <= now.getTime()) {
+        await connection.query(
+          `UPDATE visitor_sessions SET status = 'expired' WHERE id = ? AND status != 'closed'`,
+          [sessionRow.id]
+        );
+        await connection.commit();
+        return res.status(410).json({
+          status: 'expired',
+          message: 'Session has already expired and cannot be closed.',
+        });
+      }
+
+      await connection.rollback();
+      return res.status(400).json({
+        status: refreshed?.status || 'invalid',
+        message: 'Session cannot be closed in its current state.',
+      });
+    } catch (err) {
+      if (connection) {
+        try { await connection.rollback(); } catch {}
+      }
+      const safeCode = sanitizeDbErrorCode(err?.code);
+      const logFn = logger && typeof logger.error === 'function' ? logger.error.bind(logger) : console.error;
+      logFn('Visitor session close error', { code: safeCode });
+      return res.status(500).json({
+        status: 'error',
+        message: 'Unable to close session at this time. Please retry.',
+      });
+    } finally {
+      if (connection) {
+        connection.release();
+      }
+    }
+  }));
+
+  // ────────────────────────────────────────────────────────────
+  // 5. POST /api/public/sessions/:id/messages — Visitor sends a message
+  // ────────────────────────────────────────────────────────────
+  router.post('/sessions/:id/messages', messageLimiter, wrapAsyncHandler(async (req, res) => {
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+
+    const sessionId = sanitizeString(req.params.id);
+    if (!sessionId || !SESSION_ID_REGEX.test(sessionId)) {
+      return res.status(400).json({
+        status: 'invalid',
+        message: 'Invalid session identifier format.',
+      });
+    }
+
+    const suppliedCredential = extractVisitorCredential(req);
+    if (!suppliedCredential || !CREDENTIAL_REGEX.test(suppliedCredential)) {
+      return res.status(401).json({
+        status: 'unauthorized',
+        message: 'Visitor credential is required to send messages.',
+      });
+    }
+
+    if (typeof req.body?.body !== 'string') {
+      return res.status(400).json({
+        status: 'invalid',
+        message: 'Message body is required.',
+      });
+    }
+
+    const trimmedBody = req.body.body.trim();
+    if (!trimmedBody) {
+      return res.status(400).json({
+        status: 'invalid',
+        message: 'Message body cannot be empty.',
+      });
+    }
+
+    if (trimmedBody.length > MAX_MESSAGE_LENGTH) {
+      return res.status(400).json({
+        status: 'invalid',
+        message: `Message body must not exceed ${MAX_MESSAGE_LENGTH} characters.`,
+      });
+    }
+
+    let clientMessageId = null;
+    if (req.body?.clientMessageId !== undefined && req.body?.clientMessageId !== null) {
+      if (typeof req.body.clientMessageId !== 'string' || !CLIENT_MESSAGE_ID_REGEX.test(req.body.clientMessageId)) {
+        return res.status(400).json({
+          status: 'invalid',
+          message: 'Invalid clientMessageId format.',
+        });
+      }
+      clientMessageId = req.body.clientMessageId;
+    }
+
+    let connection;
+    try {
+      connection = await pool.getConnection();
+      if (typeof activeTestHook?.onConnectionAcquired === 'function') {
+        await activeTestHook.onConnectionAcquired({
+          route: 'visitor_message',
+          sessionId,
+          connection,
+          processlistId: connection.threadId,
+        });
+      }
+      await connection.beginTransaction();
+
+      const [rows] = await connection.query(
+        `SELECT id, public_id, vehicle_id, credential_hash, status, expires_at
+         FROM visitor_sessions
+         WHERE public_id = ?
+         FOR UPDATE`,
+        [sessionId]
+      );
+
+      if (!rows || rows.length === 0) {
+        await connection.rollback();
+        return res.status(404).json({
+          status: 'not_found',
+          message: 'Contact session not found.',
+        });
+      }
+
+      const sessionRow = rows[0];
+
+      const presentedHash = createHash('sha256').update(suppliedCredential).digest('hex');
+      if (!compareHashes(sessionRow.credential_hash, presentedHash)) {
+        await connection.rollback();
+        return res.status(403).json({
+          status: 'forbidden',
+          message: 'Invalid visitor credential for this session.',
+        });
+      }
+
+      // Test-only synchronization hook: invoked while holding session row lock before commit
+      if (typeof activeTestHook?.onMessageRowLocked === 'function') {
+        await activeTestHook.onMessageRowLocked({
+          route: 'visitor_message',
+          sessionId: sessionRow.public_id,
+          sessionDbId: sessionRow.id,
+          connection,
+          processlistId: connection.threadId,
+        });
+      }
+
+      const now = new Date();
+      const isPastExpiry = new Date(sessionRow.expires_at).getTime() <= now.getTime();
+      if (isPastExpiry || sessionRow.status === 'expired') {
+        if (sessionRow.status !== 'expired' && sessionRow.status !== 'closed') {
+          await connection.query(
+            `UPDATE visitor_sessions SET status = 'expired' WHERE id = ? AND status != 'closed'`,
+            [sessionRow.id]
+          );
+          await connection.commit();
+        } else {
+          await connection.rollback();
+        }
+        return res.status(400).json({
+          status: 'expired',
+          message: 'Session has expired and cannot accept messages.',
+        });
+      }
+
+      if (sessionRow.status === 'closed') {
+        await connection.rollback();
+        return res.status(400).json({
+          status: 'closed',
+          message: 'Session is closed and cannot accept messages.',
+        });
+      }
+
+      if (sessionRow.status !== 'pending' && sessionRow.status !== 'accepted') {
+        await connection.rollback();
+        return res.status(400).json({
+          status: sessionRow.status,
+          message: 'Session cannot accept messages in its current state.',
+        });
+      }
+
+      // If clientMessageId provided, handle idempotency
+      if (clientMessageId) {
+        try {
+          const [insertResult] = await connection.query(
+            `INSERT INTO visitor_messages (session_id, sender_type, body, client_message_id, created_at)
+             VALUES (?, 'visitor', ?, ?, ?)`,
+            [sessionRow.id, trimmedBody, clientMessageId, now]
+          );
+
+          await connection.commit();
+
+          // Asynchronously dispatch push notification to vehicle owner (fire-and-forget, never fails response)
+          if (sessionRow.vehicle_id) {
+            sendPushNotificationForSession({
+              pool,
+              vehicleId: sessionRow.vehicle_id,
+              sessionId: sessionRow.public_id,
+              logger,
+            }).catch((pushErr) => {
+              if (logger?.error) logger.error('Failed to dispatch push notification', { error: pushErr?.message });
+            });
+          }
+
+          return res.status(201).json({
+            status: 'sent',
+            message: {
+              id: insertResult.insertId,
+              sessionId: sessionRow.public_id,
+              senderType: 'visitor',
+              body: trimmedBody,
+              clientMessageId,
+              createdAt: now.toISOString(),
+            },
+          });
+        } catch (insertErr) {
+          if (insertErr?.code === 'ER_DUP_ENTRY') {
+            await connection.rollback();
+            const [existingRows] = await pool.query(
+              `SELECT id, session_id, sender_type, body, client_message_id, created_at
+               FROM visitor_messages
+               WHERE session_id = ? AND sender_type = 'visitor' AND client_message_id = ?
+               LIMIT 1`,
+              [sessionRow.id, clientMessageId]
+            );
+            if (existingRows.length > 0) {
+              const existing = existingRows[0];
+              return res.status(200).json({
+                status: 'sent',
+                message: {
+                  id: existing.id,
+                  sessionId: sessionRow.public_id,
+                  senderType: existing.sender_type,
+                  body: existing.body,
+                  clientMessageId: existing.client_message_id,
+                  createdAt: existing.created_at instanceof Date ? existing.created_at.toISOString() : existing.created_at,
+                },
+              });
+            }
+          }
+          throw insertErr;
+        }
+      }
+
+      // No clientMessageId: standard insert
+      const [insertResult] = await connection.query(
+        `INSERT INTO visitor_messages (session_id, sender_type, body, created_at)
+         VALUES (?, 'visitor', ?, ?)`,
+        [sessionRow.id, trimmedBody, now]
+      );
+
+      await connection.commit();
+
+      // Asynchronously dispatch push notification to vehicle owner (fire-and-forget, never fails response)
+      if (sessionRow.vehicle_id) {
+        sendPushNotificationForSession({
+          pool,
+          vehicleId: sessionRow.vehicle_id,
+          sessionId: sessionRow.public_id,
+          logger,
+        }).catch((pushErr) => {
+          if (logger?.error) logger.error('Failed to dispatch push notification', { error: pushErr?.message });
+        });
+      }
+
+      return res.status(201).json({
+        status: 'sent',
+        message: {
+          id: insertResult.insertId,
+          sessionId: sessionRow.public_id,
+          senderType: 'visitor',
+          body: trimmedBody,
+          clientMessageId: null,
+          createdAt: now.toISOString(),
+        },
+      });
+    } catch (err) {
+      if (connection) {
+        try { await connection.rollback(); } catch {}
+      }
+      const safeCode = sanitizeDbErrorCode(err?.code);
+      const logFn = logger && typeof logger.error === 'function' ? logger.error.bind(logger) : console.error;
+      logFn('Visitor message creation error', { code: safeCode });
+      return res.status(500).json({
+        status: 'error',
+        message: 'Unable to send message at this time. Please retry.',
+      });
+    } finally {
+      if (connection) {
+        connection.release();
+      }
+    }
+  }));
+
+  // ────────────────────────────────────────────────────────────
+  // 6. GET /api/public/sessions/:id/messages — Visitor retrieves message history
+  // ────────────────────────────────────────────────────────────
+  router.get('/sessions/:id/messages', readLimiter, wrapAsyncHandler(async (req, res) => {
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+
+    const sessionId = sanitizeString(req.params.id);
+    if (!sessionId || !SESSION_ID_REGEX.test(sessionId)) {
+      return res.status(400).json({
+        status: 'invalid',
+        message: 'Invalid session identifier format.',
+      });
+    }
+
+    const suppliedCredential = extractVisitorCredential(req);
+    if (!suppliedCredential || !CREDENTIAL_REGEX.test(suppliedCredential)) {
+      return res.status(401).json({
+        status: 'unauthorized',
+        message: 'Visitor credential is required to access messages.',
+      });
+    }
+
+    let afterId = 0;
+    if (req.query.after !== undefined && req.query.after !== '') {
+      const parsedAfter = Number(req.query.after);
+      if (!Number.isInteger(parsedAfter) || parsedAfter < 0) {
+        return res.status(400).json({
+          status: 'invalid',
+          message: 'Invalid after cursor; must be a non-negative integer.',
+        });
+      }
+      afterId = parsedAfter;
+    }
+
+    let limit = 50;
+    if (req.query.limit !== undefined && req.query.limit !== '') {
+      const parsedLimit = Number(req.query.limit);
+      if (!Number.isInteger(parsedLimit) || parsedLimit < 1) {
+        return res.status(400).json({
+          status: 'invalid',
+          message: 'Invalid limit; must be a positive integer.',
+        });
+      }
+      limit = Math.min(parsedLimit, 100);
+    }
+
     try {
       const [rows] = await pool.query(
-        `SELECT id, public_id, credential_hash, status, expires_at, closed_at
+        `SELECT id, public_id, credential_hash
          FROM visitor_sessions
          WHERE public_id = ?
          LIMIT 1`,
@@ -494,7 +951,6 @@ export function createPublicRouter({ pool, limiter, sessionCreateLimiter, sessio
 
       const sessionRow = rows[0];
 
-      // Verify credential
       const presentedHash = createHash('sha256').update(suppliedCredential).digest('hex');
       if (!compareHashes(sessionRow.credential_hash, presentedHash)) {
         return res.status(403).json({
@@ -503,82 +959,39 @@ export function createPublicRouter({ pool, limiter, sessionCreateLimiter, sessio
         });
       }
 
-      // Check current state before attempting conditional update
-      if (sessionRow.status === 'closed') {
-        return res.status(200).json({
-          status: 'closed',
-          message: 'Session is already closed.',
-          closedAt: sessionRow.closed_at,
-        });
-      }
-
-      const now = new Date();
-      const isPastExpiry = new Date(sessionRow.expires_at).getTime() <= now.getTime();
-      if (isPastExpiry || sessionRow.status === 'expired') {
-        if (sessionRow.status !== 'expired') {
-          await pool.query(
-            `UPDATE visitor_sessions SET status = 'expired' WHERE id = ? AND status != 'closed'`,
-            [sessionRow.id]
-          );
-        }
-        return res.status(410).json({
-          status: 'expired',
-          message: 'Session has already expired and cannot be closed.',
-        });
-      }
-
-      // Atomic conditional update ensuring status is pending or accepted and not expired
-      const [updateResult] = await pool.query(
-        `UPDATE visitor_sessions
-         SET status = 'closed', closed_at = ?
-         WHERE id = ? AND status IN ('pending', 'accepted') AND expires_at > ?`,
-        [now, sessionRow.id, now]
+      const [msgRows] = await pool.query(
+        `SELECT id, sender_type, body, client_message_id, created_at
+         FROM visitor_messages
+         WHERE session_id = ? AND id > ?
+         ORDER BY id ASC
+         LIMIT ?`,
+        [sessionRow.id, afterId, limit + 1]
       );
 
-      if (updateResult?.affectedRows === 1) {
-        return res.status(200).json({
-          status: 'closed',
-          closedAt: now.toISOString(),
-        });
-      }
+      const hasMore = msgRows.length > limit;
+      const resultRows = hasMore ? msgRows.slice(0, limit) : msgRows;
 
-      // If affectedRows === 0, state changed concurrently. Inspect persisted outcome:
-      const [refreshedRows] = await pool.query(
-        `SELECT status, expires_at, closed_at FROM visitor_sessions WHERE id = ?`,
-        [sessionRow.id]
-      );
-      const refreshed = refreshedRows[0];
+      const messages = resultRows.map((r) => ({
+        id: r.id,
+        sessionId: sessionRow.public_id,
+        senderType: r.sender_type,
+        body: r.body,
+        clientMessageId: r.client_message_id || null,
+        createdAt: r.created_at,
+      }));
 
-      if (refreshed?.status === 'closed') {
-        return res.status(200).json({
-          status: 'closed',
-          message: 'Session is already closed.',
-          closedAt: refreshed.closed_at,
-        });
-      }
-
-      if (refreshed?.status === 'expired' || new Date(refreshed?.expires_at).getTime() <= now.getTime()) {
-        await pool.query(
-          `UPDATE visitor_sessions SET status = 'expired' WHERE id = ? AND status != 'closed'`,
-          [sessionRow.id]
-        );
-        return res.status(410).json({
-          status: 'expired',
-          message: 'Session has already expired and cannot be closed.',
-        });
-      }
-
-      return res.status(400).json({
-        status: refreshed?.status || 'invalid',
-        message: 'Session cannot be closed in its current state.',
+      return res.status(200).json({
+        sessionId: sessionRow.public_id,
+        messages,
+        hasMore,
       });
     } catch (err) {
       const safeCode = sanitizeDbErrorCode(err?.code);
       const logFn = logger && typeof logger.error === 'function' ? logger.error.bind(logger) : console.error;
-      logFn('Visitor session close error', { code: safeCode });
+      logFn('Visitor messages retrieval error', { code: safeCode });
       return res.status(500).json({
         status: 'error',
-        message: 'Unable to close session at this time. Please retry.',
+        message: 'Unable to retrieve messages at this time.',
       });
     }
   }));

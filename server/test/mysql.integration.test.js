@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import { randomBytes, createHash } from 'node:crypto';
 import express from 'express';
 import session from 'express-session';
+import rateLimit from 'express-rate-limit';
 import mysql from 'mysql2/promise';
-import { applyMigrations, verifyVisitorSessionsSchema } from '../src/migrate.js';
+import { applyMigrations, verifyVisitorSessionsSchema, verifyVisitorMessagesSchema, verifyOwnerNotificationsSchema } from '../src/migrate.js';
 import { createVehiclesRouter } from '../src/routes/vehicles.js';
 import { createPublicRouter } from '../src/routes/public.js';
 import { runVisitorSessionCleanup } from '../src/services/sessionCleanup.js';
@@ -122,7 +123,7 @@ async function withDatabase(t, callback) {
   return callback(pool, dbName);
 }
 
-async function makeApp(pool, logger = { error() {} }) {
+async function makeApp(pool, logger = { error() {} }, { ownerMessageLimiter, _testHook } = {}) {
   const app = express();
   app.use(express.json());
   app.use(session({ secret: 'mysql-integration-test-session-secret-32bytes', resave: false, saveUninitialized: false }));
@@ -131,11 +132,217 @@ async function makeApp(pool, logger = { error() {} }) {
     req.session.csrfToken = 'csrf-integration-token';
     req.session.save(() => res.json({ ok: true }));
   });
-  app.use('/api/vehicles', createVehiclesRouter({ pool, origins: [origin], logger }));
-  app.use('/api/public', createPublicRouter({ pool, logger }));
+  app.use('/api/vehicles', createVehiclesRouter({ pool, origins: [origin], logger, ownerMessageLimiter, _testHook }));
+  app.use('/api/public', createPublicRouter({ pool, logger, _testHook }));
   const server = app.listen(0, '127.0.0.1');
   await new Promise((resolve) => server.once('listening', resolve));
   return { server, base: `http://127.0.0.1:${server.address().port}` };
+}
+
+async function waitForExactLockWait(pool, {
+  tableName = 'visitor_sessions',
+  expectedSessionDbId,
+  expectedSessionPublicId,
+  expectedRequestingProcesslistId,
+  expectedBlockingProcesslistId,
+  timeoutMs = 5000,
+} = {}) {
+  if (expectedSessionDbId === undefined && expectedSessionPublicId === undefined) {
+    throw new Error('waitForExactLockWait requires expectedSessionDbId or expectedSessionPublicId');
+  }
+  if (expectedRequestingProcesslistId === undefined || expectedBlockingProcesslistId === undefined) {
+    throw new Error('waitForExactLockWait requires both expectedRequestingProcesslistId and expectedBlockingProcesslistId');
+  }
+
+  const start = Date.now();
+  let lastSeenWaits = [];
+
+  while (Date.now() - start < timeoutMs) {
+    const [rows] = await pool.query(
+      `SELECT
+         w.REQUESTING_ENGINE_LOCK_ID,
+         w.REQUESTING_ENGINE_TRANSACTION_ID,
+         w.REQUESTING_THREAD_ID,
+         w.BLOCKING_ENGINE_LOCK_ID,
+         w.BLOCKING_ENGINE_TRANSACTION_ID,
+         w.BLOCKING_THREAD_ID,
+         req.OBJECT_SCHEMA,
+         req.OBJECT_NAME,
+         req.INDEX_NAME AS req_index,
+         req.LOCK_TYPE AS req_type,
+         req.LOCK_MODE AS req_mode,
+         req.LOCK_STATUS AS req_status,
+         req.LOCK_DATA AS req_lock_data,
+         req_t.PROCESSLIST_ID AS req_processlist_id,
+         blk.INDEX_NAME AS blk_index,
+         blk.LOCK_TYPE AS blk_type,
+         blk.LOCK_MODE AS blk_mode,
+         blk.LOCK_STATUS AS blk_status,
+         blk.LOCK_DATA AS blk_lock_data,
+         blk_t.PROCESSLIST_ID AS blk_processlist_id
+       FROM performance_schema.data_lock_waits w
+       JOIN performance_schema.data_locks req ON req.ENGINE_LOCK_ID = w.REQUESTING_ENGINE_LOCK_ID
+       JOIN performance_schema.data_locks blk ON blk.ENGINE_LOCK_ID = w.BLOCKING_ENGINE_LOCK_ID
+       LEFT JOIN performance_schema.threads req_t ON req_t.THREAD_ID = w.REQUESTING_THREAD_ID
+       LEFT JOIN performance_schema.threads blk_t ON blk_t.THREAD_ID = w.BLOCKING_THREAD_ID
+       WHERE req.OBJECT_SCHEMA = DATABASE()
+         AND req.OBJECT_NAME = ?
+         AND req.LOCK_STATUS = 'WAITING'
+         AND blk.LOCK_STATUS = 'GRANTED'`,
+      [tableName]
+    );
+
+    lastSeenWaits = rows || [];
+
+    for (const r of lastSeenWaits) {
+      // 1. Verify expected lock wait direction
+      if (r.req_status !== 'WAITING' || r.blk_status !== 'GRANTED') {
+        continue;
+      }
+
+      // 2. Verify requesting connection processlist ID
+      if (r.req_processlist_id !== expectedRequestingProcesslistId) {
+        continue;
+      }
+
+      // 3. Verify blocking connection processlist ID
+      if (r.blk_processlist_id !== expectedBlockingProcesslistId) {
+        continue;
+      }
+
+      // 4. Verify exact target row lock data
+      const reqData = String(r.req_lock_data ?? '');
+      const blkData = String(r.blk_lock_data ?? '');
+
+      let idMatches = false;
+      if (expectedSessionDbId !== undefined) {
+        const idPattern = new RegExp(`(^|,\\s*)${expectedSessionDbId}$`);
+        idMatches = idPattern.test(reqData) || idPattern.test(blkData);
+        if (!idMatches) continue;
+      }
+
+      if (expectedSessionPublicId !== undefined) {
+        // If the index lock data contains a public_id string, it must match expectedSessionPublicId
+        const hasPubIdInReq = reqData.includes('vs_');
+        const hasPubIdInBlk = blkData.includes('vs_');
+        if (hasPubIdInReq && !reqData.includes(expectedSessionPublicId)) continue;
+        if (hasPubIdInBlk && !blkData.includes(expectedSessionPublicId)) continue;
+        if (expectedSessionDbId === undefined && !reqData.includes(expectedSessionPublicId) && !blkData.includes(expectedSessionPublicId)) {
+          continue;
+        }
+      }
+
+      return {
+        requestingEngineTransactionId: r.REQUESTING_ENGINE_TRANSACTION_ID,
+        blockingEngineTransactionId: r.BLOCKING_ENGINE_TRANSACTION_ID,
+        requestingThreadId: r.REQUESTING_THREAD_ID,
+        blockingThreadId: r.BLOCKING_THREAD_ID,
+        requestingProcesslistId: r.req_processlist_id,
+        blockingProcesslistId: r.blk_processlist_id,
+        requestingStatus: r.req_status,
+        blockingStatus: r.blk_status,
+        requestingLockData: r.req_lock_data,
+        blockingLockData: r.blk_lock_data,
+        targetSchema: r.OBJECT_SCHEMA,
+        targetTable: r.OBJECT_NAME,
+        requestingIndex: r.req_index,
+        blockingIndex: r.blk_index,
+      };
+    }
+
+    await new Promise((res) => setTimeout(res, 10));
+  }
+
+  throw new Error(
+    `Timed out after ${timeoutMs}ms waiting for exact lock wait on ${tableName} ` +
+    `(expectedSessionDbId=${expectedSessionDbId}, expectedSessionPublicId=${expectedSessionPublicId}, ` +
+    `expectedRequestingProcesslistId=${expectedRequestingProcesslistId}, expectedBlockingProcesslistId=${expectedBlockingProcesslistId}). ` +
+    `Last seen waits: ${JSON.stringify(lastSeenWaits)}`
+  );
+}
+
+function createTestSyncGate({ pauseOnMessageRowLock = false } = {}) {
+  let resolveRowLocked;
+  let lockedMetaValue = null;
+  const rowLockedPromise = new Promise((resolve) => {
+    resolveRowLocked = resolve;
+  });
+
+  const acquiredValues = new Map();
+  const acquiredResolvers = new Map();
+
+  let resolveProceed;
+  let proceedResolved = !pauseOnMessageRowLock;
+  const proceedPromise = new Promise((resolve) => {
+    resolveProceed = resolve;
+  });
+
+  const hook = {
+    async onConnectionAcquired(meta) {
+      const route = meta?.route || 'any';
+      acquiredValues.set(route, meta);
+      acquiredValues.set('any', meta);
+
+      const specific = acquiredResolvers.get(route);
+      if (typeof specific === 'function') {
+        specific(meta);
+        acquiredResolvers.delete(route);
+      }
+      const generic = acquiredResolvers.get('any');
+      if (typeof generic === 'function') {
+        generic(meta);
+        acquiredResolvers.delete('any');
+      }
+    },
+    async onMessageRowLocked(meta) {
+      lockedMetaValue = meta;
+      if (typeof resolveRowLocked === 'function') {
+        resolveRowLocked(meta);
+        resolveRowLocked = null;
+      }
+      if (pauseOnMessageRowLock && !proceedResolved) {
+        await proceedPromise;
+      }
+    },
+  };
+
+  return {
+    hook,
+    waitForConnection: (route = 'any', timeoutMs = 5000) => {
+      if (acquiredValues.has(route)) {
+        return Promise.resolve(acquiredValues.get(route));
+      }
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          acquiredResolvers.delete(route);
+          reject(new Error(`Timed out waiting for connection acquisition on route '${route}'`));
+        }, timeoutMs);
+        acquiredResolvers.set(route, (val) => {
+          clearTimeout(timer);
+          resolve(val);
+        });
+      });
+    },
+    waitUntilRowLocked: (timeoutMs = 5000) => {
+      if (lockedMetaValue) return Promise.resolve(lockedMetaValue);
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          reject(new Error('Timed out waiting for message row lock'));
+        }, timeoutMs);
+        rowLockedPromise.then((val) => {
+          clearTimeout(timer);
+          resolve(val);
+        });
+      });
+    },
+    allowMessageToCommit: () => {
+      proceedResolved = true;
+      if (typeof resolveProceed === 'function') {
+        resolveProceed();
+        resolveProceed = null;
+      }
+    },
+  };
 }
 
 async function sessionFor(base, userId) {
@@ -759,13 +966,15 @@ test('MySQL migration and vehicle integrity integration', { skip: !enabled }, as
         assert.equal(closedIdx[1].COLUMN_NAME, 'status');
 
         // Scenario 1: Table with id INT UNSIGNED rejected
+        await conn.query('ALTER TABLE visitor_messages DROP FOREIGN KEY fk_visitor_messages_session_id');
         await conn.query('ALTER TABLE visitor_sessions MODIFY id INT UNSIGNED AUTO_INCREMENT');
         await assert.rejects(
           async () => verifyVisitorSessionsSchema(conn),
           /invalid id column definition on visitor_sessions: must be BIGINT UNSIGNED AUTO_INCREMENT/
         );
-        // Restore id
+        // Restore id and foreign key
         await conn.query('ALTER TABLE visitor_sessions MODIFY id BIGINT UNSIGNED AUTO_INCREMENT');
+        await conn.query('ALTER TABLE visitor_messages ADD CONSTRAINT fk_visitor_messages_session_id FOREIGN KEY (session_id) REFERENCES visitor_sessions(id) ON DELETE CASCADE');
         await verifyVisitorSessionsSchema(conn);
 
         // Scenario 2: Table with vehicle_id BIGINT UNSIGNED rejected
@@ -1305,6 +1514,998 @@ test('MySQL migration and vehicle integrity integration', { skip: !enabled }, as
       // Verify old closed session was purged
       const [oldRows] = await pool.query("SELECT status FROM visitor_sessions WHERE public_id = 'vs_clean_closed_old'");
       assert.equal(oldRows.length, 0);
+    });
+  });
+
+  await t.test('real MySQL migration 008 verification: schema integrity, incompatible tables, and rerun behavior', async (t) => {
+    await withDatabase(t, async (pool) => {
+      await migrate(pool);
+      const conn = await pool.getConnection();
+      try {
+        // Schema verification passes on clean migration
+        await verifyVisitorMessagesSchema(conn);
+
+        // Re-run migration is idempotent
+        await migrate(pool);
+        await verifyVisitorMessagesSchema(conn);
+
+        // An unrecorded but incompatible pre-existing table must fail verification
+        await conn.query("DELETE FROM schema_migrations WHERE version = '008_visitor_messages.sql'");
+        await conn.query('ALTER TABLE visitor_messages MODIFY body VARCHAR(255) NOT NULL');
+        await assert.rejects(
+          () => applyMigrations(pool),
+          /invalid body column definition on visitor_messages: must be TEXT NOT NULL/
+        );
+
+        const [unrecorded] = await conn.query("SELECT version FROM schema_migrations WHERE version = '008_visitor_messages.sql'");
+        assert.equal(unrecorded.length, 0, 'Migration 008 must not be recorded when column verification fails');
+
+        // Restore column contract
+        await conn.query('ALTER TABLE visitor_messages MODIFY body TEXT NOT NULL');
+        await migrate(pool);
+
+        const [recorded] = await conn.query("SELECT version FROM schema_migrations WHERE version = '008_visitor_messages.sql'");
+        assert.equal(recorded.length, 1, 'Migration 008 must be recorded when schema verification succeeds');
+
+        // Verify index idx_visitor_messages_session_id
+        const [sessionIdx] = await conn.query(
+          `SELECT COLUMN_NAME, SEQ_IN_INDEX
+           FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'visitor_messages'
+             AND INDEX_NAME = 'idx_visitor_messages_session_id'
+           ORDER BY SEQ_IN_INDEX`
+        );
+        assert.equal(sessionIdx.length, 2);
+        assert.equal(sessionIdx[0].COLUMN_NAME, 'session_id');
+        assert.equal(sessionIdx[1].COLUMN_NAME, 'id');
+
+        // Verify unique index uq_visitor_messages_client_id
+        const [clientIdx] = await conn.query(
+          `SELECT COLUMN_NAME, SEQ_IN_INDEX, NON_UNIQUE
+           FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'visitor_messages'
+             AND INDEX_NAME = 'uq_visitor_messages_client_id'
+           ORDER BY SEQ_IN_INDEX`
+        );
+        assert.equal(clientIdx.length, 3);
+        assert.equal(Number(clientIdx[0].NON_UNIQUE), 0);
+        assert.equal(clientIdx[0].COLUMN_NAME, 'session_id');
+        assert.equal(clientIdx[1].COLUMN_NAME, 'sender_type');
+        assert.equal(clientIdx[2].COLUMN_NAME, 'client_message_id');
+      } finally {
+        conn.release();
+      }
+    });
+  });
+
+  await t.test('real MySQL visitor messages: foreign key ON DELETE CASCADE, idempotency index, and two-way API flow', async (t) => {
+    await withDatabase(t, async (pool) => {
+      await migrate(pool);
+
+      // Seed owner and vehicle
+      const [userResult] = await pool.query(
+        "INSERT INTO users (full_name, email, password_hash) VALUES ('Msg Owner', 'msgowner@example.test', 'hash')"
+      );
+      const ownerId = userResult.insertId;
+
+      const [vehicleResult] = await pool.query(
+        "INSERT INTO vehicles (user_id, registration_number, vehicle_type, vehicle_model, color) VALUES (?, 'MSG123', 'car', 'Sedan', 'Silver')",
+        [ownerId]
+      );
+      const vehicleId = vehicleResult.insertId;
+
+      const [qrResult] = await pool.query(
+        "INSERT INTO qr_codes (vehicle_id, active_vehicle_id, token_hash, status) VALUES (?, ?, REPEAT('m', 64), 'active')",
+        [vehicleId, vehicleId]
+      );
+
+      // Seed visitor session
+      const rawCred = 'vcred_' + randomBytes(32).toString('hex');
+      const credHash = createHash('sha256').update(rawCred).digest('hex');
+      const publicId = 'vs_' + randomBytes(24).toString('hex');
+
+      const [sessResult] = await pool.query(
+        `INSERT INTO visitor_sessions (public_id, vehicle_id, credential_hash, status, created_at, expires_at)
+         VALUES (?, ?, ?, 'pending', NOW(), NOW() + INTERVAL 24 HOUR)`,
+        [publicId, vehicleId, credHash]
+      );
+      const sessionDbId = sessResult.insertId;
+
+      // 1. Verify Unique Constraint on client_message_id
+      await pool.query(
+        "INSERT INTO visitor_messages (session_id, sender_type, body, client_message_id) VALUES (?, 'visitor', 'First msg', 'cid_1')",
+        [sessionDbId]
+      );
+
+      // Same client_message_id for same session and sender must be rejected by unique index
+      await assert.rejects(
+        () => pool.query(
+          "INSERT INTO visitor_messages (session_id, sender_type, body, client_message_id) VALUES (?, 'visitor', 'Dup msg', 'cid_1')",
+          [sessionDbId]
+        ),
+        (err) => err && (err.code === 'ER_DUP_ENTRY' || String(err.message).includes('Duplicate entry'))
+      );
+
+      // Same client_message_id for DIFFERENT sender_type ('owner') succeeds
+      await pool.query(
+        "INSERT INTO visitor_messages (session_id, sender_type, body, client_message_id) VALUES (?, 'owner', 'Owner reply', 'cid_1')",
+        [sessionDbId]
+      );
+
+      // NULL client_message_id can be inserted multiple times
+      await pool.query(
+        "INSERT INTO visitor_messages (session_id, sender_type, body, client_message_id) VALUES (?, 'visitor', 'Null cid 1', NULL)",
+        [sessionDbId]
+      );
+      await pool.query(
+        "INSERT INTO visitor_messages (session_id, sender_type, body, client_message_id) VALUES (?, 'visitor', 'Null cid 2', NULL)",
+        [sessionDbId]
+      );
+
+      // 2. Verify Foreign Key ON DELETE CASCADE
+      const [beforeCount] = await pool.query(
+        'SELECT COUNT(*) AS cnt FROM visitor_messages WHERE session_id = ?',
+        [sessionDbId]
+      );
+      assert.equal(Number(beforeCount[0].cnt), 4);
+
+      // Delete the session from visitor_sessions
+      await pool.query('DELETE FROM visitor_sessions WHERE id = ?', [sessionDbId]);
+
+      // All associated visitor_messages must be CASCADE deleted
+      const [afterCount] = await pool.query(
+        'SELECT COUNT(*) AS cnt FROM visitor_messages WHERE session_id = ?',
+        [sessionDbId]
+      );
+      assert.equal(Number(afterCount[0].cnt), 0, 'visitor_messages must be cascade-deleted when parent visitor_session is deleted');
+
+      // 3. End-to-end API Messaging Flow with real MySQL
+      const { server, base } = await makeApp(pool);
+      try {
+        const ownerCookie = await sessionFor(base, ownerId);
+
+        // Create new active session for API testing
+        const publicId2 = 'vs_' + randomBytes(24).toString('hex');
+        const [sessResult2] = await pool.query(
+          `INSERT INTO visitor_sessions (public_id, vehicle_id, credential_hash, status, created_at, expires_at)
+           VALUES (?, ?, ?, 'pending', NOW(), NOW() + INTERVAL 24 HOUR)`,
+          [publicId2, vehicleId, credHash]
+        );
+
+        // Visitor sends message via public API immediately while pending
+        const visitorMsgRes = await fetch(`${base}/api/public/sessions/${publicId2}/messages`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Visitor-Credential': rawCred,
+          },
+          body: JSON.stringify({
+            body: 'Hello owner, this is an urgent visitor alert.',
+            clientMessageId: 'cm_vis_api_1',
+          }),
+        });
+        assert.equal(visitorMsgRes.status, 201);
+        const visitorMsgData = await visitorMsgRes.json();
+        assert.equal(visitorMsgData.status, 'sent');
+        assert.equal(visitorMsgData.message.senderType, 'visitor');
+        assert.equal(visitorMsgData.message.body, 'Hello owner, this is an urgent visitor alert.');
+
+        // Owner checks inbox: message count is 1 and preview contains the message
+        const inboxRes = await request(base, ownerCookie, 'GET', '/sessions/inbox', undefined, false);
+        assert.equal(inboxRes.status, 200);
+        const inboxData = await inboxRes.json();
+        const sessionEntry = inboxData.sessions.find((s) => s.sessionId === publicId2);
+        assert.ok(sessionEntry);
+        assert.equal(sessionEntry.messageCount, 1);
+        assert.equal(sessionEntry.lastMessage?.body, 'Hello owner, this is an urgent visitor alert.');
+
+        // Owner replies while session is still pending (acceptance NOT required)
+        const ownerReplyRes = await request(
+          base,
+          ownerCookie,
+          'POST',
+          `/sessions/${publicId2}/messages`,
+          {
+            body: 'Acknowledged! I will move the car shortly.',
+            clientMessageId: 'cm_owner_reply_1',
+          }
+        );
+        assert.equal(ownerReplyRes.status, 201);
+        const ownerReplyData = await ownerReplyRes.json();
+        assert.equal(ownerReplyData.status, 'sent');
+        assert.equal(ownerReplyData.message.senderType, 'owner');
+        assert.equal(ownerReplyData.message.body, 'Acknowledged! I will move the car shortly.');
+
+        // Visitor polls messages: receives 2 messages in chronological order
+        const visitorPollRes = await fetch(`${base}/api/public/sessions/${publicId2}/messages`, {
+          method: 'GET',
+          headers: {
+            'X-Visitor-Credential': rawCred,
+          },
+        });
+        assert.equal(visitorPollRes.status, 200);
+        const visitorPollData = await visitorPollRes.json();
+        assert.equal(visitorPollData.messages.length, 2);
+        assert.equal(visitorPollData.messages[0].senderType, 'visitor');
+        assert.equal(visitorPollData.messages[1].senderType, 'owner');
+
+        // Owner closes session
+        const closeRes = await request(base, ownerCookie, 'POST', `/sessions/${publicId2}/close`, {});
+        assert.equal(closeRes.status, 200);
+
+        // Message to closed session is rejected
+        const rejectedVisRes = await fetch(`${base}/api/public/sessions/${publicId2}/messages`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Visitor-Credential': rawCred,
+          },
+          body: JSON.stringify({ body: 'Are you there?' }),
+        });
+        assert.equal(rejectedVisRes.status, 400);
+
+        const rejectedOwnerRes = await request(
+          base,
+          ownerCookie,
+          'POST',
+          `/sessions/${publicId2}/messages`,
+          { body: 'Post-close owner message' }
+        );
+        assert.equal(rejectedOwnerRes.status, 400);
+      } finally {
+        server.close();
+      }
+    });
+  });
+
+  await t.test('real MySQL concurrency: concurrent session closure wins lock -> message creation serializes and is rejected with 400 (visitor and owner)', async (t) => {
+    await withDatabase(t, async (pool) => {
+      await migrate(pool);
+
+      // Seed owner, vehicle, and sessions
+      const [uRes] = await pool.query("INSERT INTO users (full_name, email, password_hash) VALUES ('Race Owner 1', 'race1@parkx.ai', 'hash')");
+      const ownerId = uRes.insertId;
+
+      const [vRes] = await pool.query(
+        "INSERT INTO vehicles (user_id, registration_number, vehicle_type, vehicle_model, color) VALUES (?, 'RACE-1-CLOSURE', 'car', 'Tesla Model 3', 'White')",
+        [ownerId]
+      );
+      const vehicleId = vRes.insertId;
+
+      // 1A. Visitor message creation races with concurrent closure (closure wins)
+      const gate1 = createTestSyncGate();
+      const harness1 = await makeApp(pool, { error() {} }, { _testHook: gate1.hook });
+      t.after(() => {
+        gate1.allowMessageToCommit();
+        harness1.server.close();
+      });
+
+      const rawCred1 = 'vcred_' + randomBytes(32).toString('hex');
+      const credHash1 = createHash('sha256').update(rawCred1).digest('hex');
+      const sid1 = 'vs_' + randomBytes(24).toString('hex');
+
+      const [sessRes1] = await pool.query(
+        `INSERT INTO visitor_sessions (public_id, vehicle_id, credential_hash, status, created_at, expires_at)
+         VALUES (?, ?, ?, 'pending', NOW(), NOW() + INTERVAL 24 HOUR)`,
+        [sid1, vehicleId, credHash1]
+      );
+      const sDbId1 = sessRes1.insertId;
+
+      // Thread A acquires exclusive lock on session 1
+      const connA = await pool.getConnection();
+      try {
+        await connA.beginTransaction();
+        const [lockedSession] = await connA.query('SELECT id FROM visitor_sessions WHERE public_id = ? FOR UPDATE', [sid1]);
+        assert.equal(lockedSession[0].id, sDbId1);
+
+        // Thread B: Visitor attempts to send a message via actual HTTP endpoint
+        const visitorMsgPromise = fetch(`${harness1.base}/api/public/sessions/${sid1}/messages`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Visitor-Credential': rawCred1,
+          },
+          body: JSON.stringify({ body: 'Raced visitor message' }),
+        });
+
+        // Capture HTTP endpoint connection identity before its locking query blocks
+        const connMeta1 = await gate1.waitForConnection('visitor_message');
+        assert.ok(connMeta1.processlistId, 'HTTP endpoint must report valid processlistId');
+
+        // Explicit MySQL synchronization: verify via performance_schema that HTTP transaction is actively WAITING for target session row lock on connA
+        const lockWait1 = await waitForExactLockWait(pool, {
+          tableName: 'visitor_sessions',
+          expectedSessionDbId: sDbId1,
+          expectedSessionPublicId: sid1,
+          expectedRequestingProcesslistId: connMeta1.processlistId,
+          expectedBlockingProcesslistId: connA.threadId,
+        });
+        assert.equal(lockWait1.requestingStatus, 'WAITING', 'Visitor message request must be genuinely waiting on session row lock');
+        assert.equal(lockWait1.blockingStatus, 'GRANTED', 'Test transaction must hold blocking granted lock');
+        assert.equal(lockWait1.requestingProcesslistId, connMeta1.processlistId);
+        assert.equal(lockWait1.blockingProcesslistId, connA.threadId);
+
+        // Thread A closes the session while still holding the lock
+        await connA.query("UPDATE visitor_sessions SET status = 'closed', closed_at = NOW() WHERE id = ?", [sDbId1]);
+        await connA.commit();
+
+        // Now Thread B unblocks
+        const visitorMsgRes = await visitorMsgPromise;
+        assert.equal(visitorMsgRes.status, 400);
+        const visitorMsgData = await visitorMsgRes.json();
+        assert.equal(visitorMsgData.status, 'closed');
+
+        // Confirm 0 messages inserted in DB
+        const [msgCountRows1] = await pool.query('SELECT COUNT(*) AS cnt FROM visitor_messages WHERE session_id = ?', [sDbId1]);
+        assert.equal(Number(msgCountRows1[0].cnt), 0, 'No message must be inserted into closed session');
+      } finally {
+        await connA.rollback().catch(() => {});
+        connA.release();
+      }
+
+      // 1B. Owner message creation races with concurrent closure (closure wins)
+      const gate2 = createTestSyncGate();
+      const harness2 = await makeApp(pool, { error() {} }, { _testHook: gate2.hook });
+      t.after(() => {
+        gate2.allowMessageToCommit();
+        harness2.server.close();
+      });
+
+      const ownerCookie2 = await sessionFor(harness2.base, ownerId);
+
+      const rawCred2 = 'vcred_' + randomBytes(32).toString('hex');
+      const credHash2 = createHash('sha256').update(rawCred2).digest('hex');
+      const sid2 = 'vs_' + randomBytes(24).toString('hex');
+
+      const [sessRes2] = await pool.query(
+        `INSERT INTO visitor_sessions (public_id, vehicle_id, credential_hash, status, created_at, expires_at)
+         VALUES (?, ?, ?, 'pending', NOW(), NOW() + INTERVAL 24 HOUR)`,
+        [sid2, vehicleId, credHash2]
+      );
+      const sDbId2 = sessRes2.insertId;
+
+      const connB = await pool.getConnection();
+      try {
+        await connB.beginTransaction();
+        const [lockedSession2] = await connB.query('SELECT id FROM visitor_sessions WHERE public_id = ? FOR UPDATE', [sid2]);
+        assert.equal(lockedSession2[0].id, sDbId2);
+
+        // Owner attempts to send a reply via actual HTTP endpoint
+        const ownerMsgPromise = request(harness2.base, ownerCookie2, 'POST', `/sessions/${sid2}/messages`, {
+          body: 'Raced owner message',
+        });
+
+        const connMeta2 = await gate2.waitForConnection('owner_message');
+        assert.ok(connMeta2.processlistId, 'Owner message endpoint must report valid processlistId');
+
+        // Explicit MySQL synchronization: verify via performance_schema that owner request is actively WAITING for row lock
+        const lockWait2 = await waitForExactLockWait(pool, {
+          tableName: 'visitor_sessions',
+          expectedSessionDbId: sDbId2,
+          expectedSessionPublicId: sid2,
+          expectedRequestingProcesslistId: connMeta2.processlistId,
+          expectedBlockingProcesslistId: connB.threadId,
+        });
+        assert.equal(lockWait2.requestingStatus, 'WAITING', 'Owner message request must be genuinely waiting on session row lock');
+        assert.equal(lockWait2.blockingStatus, 'GRANTED', 'Test transaction must hold blocking granted lock');
+        assert.equal(lockWait2.requestingProcesslistId, connMeta2.processlistId);
+        assert.equal(lockWait2.blockingProcesslistId, connB.threadId);
+
+        await connB.query("UPDATE visitor_sessions SET status = 'closed', closed_at = NOW() WHERE id = ?", [sDbId2]);
+        await connB.commit();
+
+        const ownerMsgRes = await ownerMsgPromise;
+        assert.equal(ownerMsgRes.status, 400);
+        const ownerMsgData = await ownerMsgRes.json();
+        assert.equal(ownerMsgData.status, 'closed');
+
+        const [msgCountRows2] = await pool.query('SELECT COUNT(*) AS cnt FROM visitor_messages WHERE session_id = ?', [sDbId2]);
+        assert.equal(Number(msgCountRows2[0].cnt), 0, 'No owner message must be inserted into closed session');
+      } finally {
+        await connB.rollback().catch(() => {});
+        connB.release();
+      }
+    });
+  });
+
+  await t.test('real MySQL concurrency: message creation obtains lock first -> completes before closure (visitor and owner)', async (t) => {
+    await withDatabase(t, async (pool) => {
+      await migrate(pool);
+
+      const [uRes] = await pool.query("INSERT INTO users (full_name, email, password_hash) VALUES ('Order Owner', 'order@parkx.ai', 'hash')");
+      const ownerId = uRes.insertId;
+
+      const [vRes] = await pool.query(
+        "INSERT INTO vehicles (user_id, registration_number, vehicle_type, vehicle_model, color) VALUES (?, 'RACE-2-ORDER', 'car', 'Polestar 2', 'Midnight')",
+        [ownerId]
+      );
+      const vehicleId = vRes.insertId;
+
+      // 2A. Visitor message obtains lock first via actual HTTP endpoint -> closure blocks until message commit
+      const gateA = createTestSyncGate({ pauseOnMessageRowLock: true });
+      const harnessA = await makeApp(pool, { error() {} }, { _testHook: gateA.hook });
+      t.after(() => {
+        gateA.allowMessageToCommit();
+        harnessA.server.close();
+      });
+
+      const ownerCookieA = await sessionFor(harnessA.base, ownerId);
+
+      const rawCred1 = 'vcred_' + randomBytes(32).toString('hex');
+      const credHash1 = createHash('sha256').update(rawCred1).digest('hex');
+      const sid1 = 'vs_' + randomBytes(24).toString('hex');
+
+      const [sessRes1] = await pool.query(
+        `INSERT INTO visitor_sessions (public_id, vehicle_id, credential_hash, status, created_at, expires_at)
+         VALUES (?, ?, ?, 'pending', NOW(), NOW() + INTERVAL 24 HOUR)`,
+        [sid1, vehicleId, credHash1]
+      );
+      const sDbId1 = sessRes1.insertId;
+
+      // 1. Invoke actual visitor message endpoint
+      const visitorMsgPromise = fetch(`${harnessA.base}/api/public/sessions/${sid1}/messages`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Visitor-Credential': rawCred1,
+        },
+        body: JSON.stringify({ body: 'Pre-close visitor msg' }),
+      });
+
+      // 2. Establish deterministic synchronization proving message endpoint acquired row lock
+      const lockedMetaA = await gateA.waitUntilRowLocked();
+      assert.equal(lockedMetaA.sessionId, sid1);
+      assert.equal(lockedMetaA.sessionDbId, sDbId1);
+      assert.ok(lockedMetaA.processlistId, 'Locked metadata must include processlistId');
+
+      // Verify row lock in performance_schema
+      const [locksA] = await pool.query(
+        `SELECT * FROM performance_schema.data_locks
+         WHERE OBJECT_SCHEMA = DATABASE() AND OBJECT_NAME = 'visitor_sessions' AND LOCK_TYPE = 'RECORD' AND LOCK_STATUS = 'GRANTED'`
+      );
+      assert.ok(locksA.length > 0, 'Message endpoint must hold granted record lock in MySQL');
+
+      // 3. While message endpoint holds lock, start actual owner closure endpoint
+      const closePromiseA = request(harnessA.base, ownerCookieA, 'POST', `/sessions/${sid1}/close`, {});
+
+      const closeConnMetaA = await gateA.waitForConnection('owner_close');
+      assert.ok(closeConnMetaA.processlistId, 'Closure endpoint must report valid processlistId');
+
+      // 4. Prove closure is waiting on the row lock held by message endpoint with exact identities and row
+      const lockWaitA = await waitForExactLockWait(pool, {
+        tableName: 'visitor_sessions',
+        expectedSessionDbId: sDbId1,
+        expectedSessionPublicId: sid1,
+        expectedRequestingProcesslistId: closeConnMetaA.processlistId,
+        expectedBlockingProcesslistId: lockedMetaA.processlistId,
+      });
+      assert.equal(lockWaitA.requestingStatus, 'WAITING', 'Closure endpoint must be waiting on row lock');
+      assert.equal(lockWaitA.blockingStatus, 'GRANTED', 'Message endpoint must be the blocking transaction');
+      assert.equal(lockWaitA.requestingProcesslistId, closeConnMetaA.processlistId);
+      assert.equal(lockWaitA.blockingProcesslistId, lockedMetaA.processlistId);
+
+      // 5. Allow message creation to finish and commit
+      gateA.allowMessageToCommit();
+
+      // 6. Verify message endpoint succeeds and closure subsequently completes
+      const msgResA = await visitorMsgPromise;
+      assert.equal(msgResA.status, 201);
+      const msgDataA = await msgResA.json();
+      assert.equal(msgDataA.status, 'sent');
+
+      const closeResA = await closePromiseA;
+      assert.equal(closeResA.status, 200);
+      const closeDataA = await closeResA.json();
+      assert.equal(closeDataA.status, 'closed');
+
+      // 7. Query MySQL: prove message exists and session is closed
+      const [msgRows1] = await pool.query('SELECT body, sender_type FROM visitor_messages WHERE session_id = ?', [sDbId1]);
+      assert.equal(msgRows1.length, 1);
+      assert.equal(msgRows1[0].body, 'Pre-close visitor msg');
+      assert.equal(msgRows1[0].sender_type, 'visitor');
+
+      const [sRows1] = await pool.query('SELECT status, closed_at FROM visitor_sessions WHERE id = ?', [sDbId1]);
+      assert.equal(sRows1[0].status, 'closed');
+      assert.ok(sRows1[0].closed_at);
+
+      // 2B. Owner message obtains lock first via actual HTTP endpoint -> visitor close blocks until message commit
+      const gateB = createTestSyncGate({ pauseOnMessageRowLock: true });
+      const harnessB = await makeApp(pool, { error() {} }, { _testHook: gateB.hook });
+      t.after(() => {
+        gateB.allowMessageToCommit();
+        harnessB.server.close();
+      });
+
+      const ownerCookieB = await sessionFor(harnessB.base, ownerId);
+
+      const rawCred2 = 'vcred_' + randomBytes(32).toString('hex');
+      const credHash2 = createHash('sha256').update(rawCred2).digest('hex');
+      const sid2 = 'vs_' + randomBytes(24).toString('hex');
+
+      const [sessRes2] = await pool.query(
+        `INSERT INTO visitor_sessions (public_id, vehicle_id, credential_hash, status, created_at, expires_at)
+         VALUES (?, ?, ?, 'pending', NOW(), NOW() + INTERVAL 24 HOUR)`,
+        [sid2, vehicleId, credHash2]
+      );
+      const sDbId2 = sessRes2.insertId;
+
+      // 1. Invoke actual owner message endpoint
+      const ownerMsgPromise = request(harnessB.base, ownerCookieB, 'POST', `/sessions/${sid2}/messages`, {
+        body: 'Pre-close owner msg',
+      });
+
+      // 2. Establish deterministic synchronization proving owner endpoint acquired row lock
+      const lockedMetaB = await gateB.waitUntilRowLocked();
+      assert.equal(lockedMetaB.sessionId, sid2);
+      assert.equal(lockedMetaB.sessionDbId, sDbId2);
+      assert.ok(lockedMetaB.processlistId, 'Locked metadata must include processlistId');
+
+      const [locksB] = await pool.query(
+        `SELECT * FROM performance_schema.data_locks
+         WHERE OBJECT_SCHEMA = DATABASE() AND OBJECT_NAME = 'visitor_sessions' AND LOCK_TYPE = 'RECORD' AND LOCK_STATUS = 'GRANTED'`
+      );
+      assert.ok(locksB.length > 0, 'Owner endpoint must hold granted record lock in MySQL');
+
+      // 3. While owner message holds lock, start actual visitor closure endpoint
+      const closePromiseB = fetch(`${harnessB.base}/api/public/sessions/${sid2}/close`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Visitor-Credential': rawCred2,
+        },
+      });
+
+      const closeConnMetaB = await gateB.waitForConnection('visitor_close');
+      assert.ok(closeConnMetaB.processlistId, 'Visitor close endpoint must report valid processlistId');
+
+      // 4. Prove visitor closure is waiting on the row lock held by owner message endpoint
+      const lockWaitB = await waitForExactLockWait(pool, {
+        tableName: 'visitor_sessions',
+        expectedSessionDbId: sDbId2,
+        expectedSessionPublicId: sid2,
+        expectedRequestingProcesslistId: closeConnMetaB.processlistId,
+        expectedBlockingProcesslistId: lockedMetaB.processlistId,
+      });
+      assert.equal(lockWaitB.requestingStatus, 'WAITING', 'Visitor closure must be waiting on row lock');
+      assert.equal(lockWaitB.blockingStatus, 'GRANTED', 'Owner message must be the blocking transaction');
+      assert.equal(lockWaitB.requestingProcesslistId, closeConnMetaB.processlistId);
+      assert.equal(lockWaitB.blockingProcesslistId, lockedMetaB.processlistId);
+
+      // 5. Allow owner message to finish and commit
+      gateB.allowMessageToCommit();
+
+      // 6. Verify owner message endpoint succeeds and closure subsequently completes
+      const msgResB = await ownerMsgPromise;
+      assert.equal(msgResB.status, 201);
+      const msgDataB = await msgResB.json();
+      assert.equal(msgDataB.status, 'sent');
+
+      const closeResB = await closePromiseB;
+      assert.equal(closeResB.status, 200);
+      const closeDataB = await closeResB.json();
+      assert.equal(closeDataB.status, 'closed');
+
+      // 7. Query MySQL: prove message exists and session is closed
+      const [msgRows2] = await pool.query('SELECT body, sender_type FROM visitor_messages WHERE session_id = ?', [sDbId2]);
+      assert.equal(msgRows2.length, 1);
+      assert.equal(msgRows2[0].body, 'Pre-close owner msg');
+      assert.equal(msgRows2[0].sender_type, 'owner');
+
+      const [sRows2] = await pool.query('SELECT status, closed_at FROM visitor_sessions WHERE id = ?', [sDbId2]);
+      assert.equal(sRows2[0].status, 'closed');
+      assert.ok(sRows2[0].closed_at);
+    });
+  });
+
+  await t.test('real MySQL concurrency: session expiry racing with message creation', async (t) => {
+    await withDatabase(t, async (pool) => {
+      await migrate(pool);
+
+      const [uRes] = await pool.query("INSERT INTO users (full_name, email, password_hash) VALUES ('Expiry Owner', 'expiry@parkx.ai', 'hash')");
+      const ownerId = uRes.insertId;
+
+      const [vRes] = await pool.query(
+        "INSERT INTO vehicles (user_id, registration_number, vehicle_type, vehicle_model, color) VALUES (?, 'RACE-3-EXPIRY', 'car', 'BMW i4', 'Blue')",
+        [ownerId]
+      );
+      const vehicleId = vRes.insertId;
+
+      // 3A. Concurrent transaction expires session while message creation waits on row lock
+      const gate3 = createTestSyncGate();
+      const harness3 = await makeApp(pool, { error() {} }, { _testHook: gate3.hook });
+      t.after(() => {
+        gate3.allowMessageToCommit();
+        harness3.server.close();
+      });
+
+      const ownerCookie3 = await sessionFor(harness3.base, ownerId);
+
+      const rawCred1 = 'vcred_' + randomBytes(32).toString('hex');
+      const credHash1 = createHash('sha256').update(rawCred1).digest('hex');
+      const sid1 = 'vs_' + randomBytes(24).toString('hex');
+
+      const [sessRes1] = await pool.query(
+        `INSERT INTO visitor_sessions (public_id, vehicle_id, credential_hash, status, created_at, expires_at)
+         VALUES (?, ?, ?, 'pending', NOW(), NOW() + INTERVAL 24 HOUR)`,
+        [sid1, vehicleId, credHash1]
+      );
+      const sDbId1 = sessRes1.insertId;
+
+      const connA = await pool.getConnection();
+      try {
+        await connA.beginTransaction();
+        const [lockedSession1] = await connA.query('SELECT id FROM visitor_sessions WHERE public_id = ? FOR UPDATE', [sid1]);
+        assert.equal(lockedSession1[0].id, sDbId1);
+
+        // Visitor attempts to send message via actual HTTP endpoint
+        const msgPromise = fetch(`${harness3.base}/api/public/sessions/${sid1}/messages`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Visitor-Credential': rawCred1,
+          },
+          body: JSON.stringify({ body: 'Raced expiry message' }),
+        });
+
+        const connMeta1 = await gate3.waitForConnection('visitor_message');
+        assert.ok(connMeta1.processlistId, 'Visitor message endpoint must report valid processlistId');
+
+        // Explicit MySQL synchronization: verify via performance_schema that visitor request is actively WAITING for row lock
+        const lockWait = await waitForExactLockWait(pool, {
+          tableName: 'visitor_sessions',
+          expectedSessionDbId: sDbId1,
+          expectedSessionPublicId: sid1,
+          expectedRequestingProcesslistId: connMeta1.processlistId,
+          expectedBlockingProcesslistId: connA.threadId,
+        });
+        assert.equal(lockWait.requestingStatus, 'WAITING', 'Message request must be waiting for session row lock');
+        assert.equal(lockWait.blockingStatus, 'GRANTED', 'Test transaction must hold blocking lock');
+        assert.equal(lockWait.requestingProcesslistId, connMeta1.processlistId);
+        assert.equal(lockWait.blockingProcesslistId, connA.threadId);
+
+        // ConnA marks session expired while holding lock
+        await connA.query("UPDATE visitor_sessions SET status = 'expired' WHERE id = ?", [sDbId1]);
+        await connA.commit();
+
+        const msgRes = await msgPromise;
+        assert.equal(msgRes.status, 400);
+        const msgData = await msgRes.json();
+        assert.equal(msgData.status, 'expired');
+
+        const [msgCount] = await pool.query('SELECT COUNT(*) AS cnt FROM visitor_messages WHERE session_id = ?', [sDbId1]);
+        assert.equal(Number(msgCount[0].cnt), 0, 'No message must be inserted into expired session');
+      } finally {
+        await connA.rollback().catch(() => {});
+        connA.release();
+      }
+
+      // 3B. Wall-clock expiry racing: session is past expires_at
+      const rawCred2 = 'vcred_' + randomBytes(32).toString('hex');
+      const credHash2 = createHash('sha256').update(rawCred2).digest('hex');
+      const sid2 = 'vs_' + randomBytes(24).toString('hex');
+
+      const [sessResult2] = await pool.query(
+        `INSERT INTO visitor_sessions (public_id, vehicle_id, credential_hash, status, created_at, expires_at)
+         VALUES (?, ?, ?, 'pending', NOW() - INTERVAL 2 HOUR, NOW() - INTERVAL 10 SECOND)`,
+        [sid2, vehicleId, credHash2]
+      );
+      const sDbId2 = sessResult2.insertId;
+
+      // Visitor attempts message
+      const visExpiredRes = await fetch(`${harness3.base}/api/public/sessions/${sid2}/messages`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Visitor-Credential': rawCred2,
+        },
+        body: JSON.stringify({ body: 'Late visitor message' }),
+      });
+      assert.equal(visExpiredRes.status, 400);
+      const visExpiredData = await visExpiredRes.json();
+      assert.equal(visExpiredData.status, 'expired');
+
+      // Owner attempts reply
+      const ownerExpiredRes = await request(harness3.base, ownerCookie3, 'POST', `/sessions/${sid2}/messages`, {
+        body: 'Late owner reply',
+      });
+      assert.equal(ownerExpiredRes.status, 400);
+      const ownerExpiredData = await ownerExpiredRes.json();
+      assert.equal(ownerExpiredData.status, 'expired');
+
+      // Database row must be updated to status = 'expired'
+      const [persistedSess] = await pool.query('SELECT status FROM visitor_sessions WHERE id = ?', [sDbId2]);
+      assert.equal(persistedSess[0].status, 'expired');
+
+      const [afterMsgCount] = await pool.query('SELECT COUNT(*) AS cnt FROM visitor_messages WHERE session_id = ?', [sDbId2]);
+      assert.equal(Number(afterMsgCount[0].cnt), 0);
+    });
+  });
+
+  await t.test('real MySQL concurrency negative test: unrelated transaction waiting on different row or mismatched connection cannot satisfy exact lock observation', async (t) => {
+    await withDatabase(t, async (pool) => {
+      await migrate(pool);
+
+      const [uRes] = await pool.query("INSERT INTO users (full_name, email, password_hash) VALUES ('Neg Owner', 'neg@parkx.ai', 'hash')");
+      const ownerId = uRes.insertId;
+
+      const [vRes] = await pool.query(
+        "INSERT INTO vehicles (user_id, registration_number, vehicle_type, vehicle_model, color) VALUES (?, 'NEG-TEST-1', 'car', 'Ionic 5', 'Silver')",
+        [ownerId]
+      );
+      const vehicleId = vRes.insertId;
+
+      // Create Session A (row 1) and Session B (row 2)
+      const sidA = 'vs_' + randomBytes(24).toString('hex');
+      const [sessResA] = await pool.query(
+        "INSERT INTO visitor_sessions (public_id, vehicle_id, credential_hash, status, created_at, expires_at) VALUES (?, ?, 'hashA', 'pending', NOW(), NOW() + INTERVAL 24 HOUR)",
+        [sidA, vehicleId]
+      );
+      const sDbIdA = sessResA.insertId;
+
+      const sidB = 'vs_' + randomBytes(24).toString('hex');
+      const [sessResB] = await pool.query(
+        "INSERT INTO visitor_sessions (public_id, vehicle_id, credential_hash, status, created_at, expires_at) VALUES (?, ?, 'hashB', 'pending', NOW(), NOW() + INTERVAL 24 HOUR)",
+        [sidB, vehicleId]
+      );
+      const sDbIdB = sessResB.insertId;
+
+      const conn1 = await pool.getConnection();
+      const conn2 = await pool.getConnection();
+
+      try {
+        await conn1.beginTransaction();
+        await conn1.query('SELECT id FROM visitor_sessions WHERE id = ? FOR UPDATE', [sDbIdA]);
+
+        // conn2 attempts to lock Session A -> blocks waiting for conn1
+        await conn2.beginTransaction();
+        const conn2Promise = conn2.query('SELECT id FROM visitor_sessions WHERE id = ? FOR UPDATE', [sDbIdA]);
+
+        // Negative check 1: Searching for Session B (different row) must reject/time out
+        await assert.rejects(
+          waitForExactLockWait(pool, {
+            tableName: 'visitor_sessions',
+            expectedSessionDbId: sDbIdB,
+            expectedSessionPublicId: sidB,
+            expectedRequestingProcesslistId: conn2.threadId,
+            expectedBlockingProcesslistId: conn1.threadId,
+            timeoutMs: 300,
+          }),
+          /Timed out after/
+        );
+
+        // Negative check 2: Searching with wrong requesting connection must reject/time out
+        await assert.rejects(
+          waitForExactLockWait(pool, {
+            tableName: 'visitor_sessions',
+            expectedSessionDbId: sDbIdA,
+            expectedSessionPublicId: sidA,
+            expectedRequestingProcesslistId: 999999,
+            expectedBlockingProcesslistId: conn1.threadId,
+            timeoutMs: 300,
+          }),
+          /Timed out after/
+        );
+
+        // Negative check 3: Searching with wrong blocking connection must reject/time out
+        await assert.rejects(
+          waitForExactLockWait(pool, {
+            tableName: 'visitor_sessions',
+            expectedSessionDbId: sDbIdA,
+            expectedSessionPublicId: sidA,
+            expectedRequestingProcesslistId: conn2.threadId,
+            expectedBlockingProcesslistId: 999999,
+            timeoutMs: 300,
+          }),
+          /Timed out after/
+        );
+
+        // Positive check: Searching for exact Session A, exact conn2 requesting, exact conn1 blocking succeeds!
+        const exactWait = await waitForExactLockWait(pool, {
+          tableName: 'visitor_sessions',
+          expectedSessionDbId: sDbIdA,
+          expectedSessionPublicId: sidA,
+          expectedRequestingProcesslistId: conn2.threadId,
+          expectedBlockingProcesslistId: conn1.threadId,
+          timeoutMs: 3000,
+        });
+        assert.equal(exactWait.requestingStatus, 'WAITING');
+        assert.equal(exactWait.blockingStatus, 'GRANTED');
+        assert.equal(exactWait.requestingProcesslistId, conn2.threadId);
+        assert.equal(exactWait.blockingProcesslistId, conn1.threadId);
+
+        // Rollback conn1 to unblock conn2
+        await conn1.rollback();
+        await conn2Promise;
+        await conn2.rollback();
+      } finally {
+        await conn1.rollback().catch(() => {});
+        await conn2.rollback().catch(() => {});
+        conn1.release();
+        conn2.release();
+      }
+    });
+  });
+
+  await t.test('real MySQL end-to-end: owner reply rate limiting isolates counters per owner', async (t) => {
+    await withDatabase(t, async (pool) => {
+      await migrate(pool);
+
+      const ownerLimiter = rateLimit({
+        windowMs: 60 * 1000,
+        max: 2,
+        standardHeaders: true,
+        legacyHeaders: false,
+        keyGenerator: (req) => String(req.session?.userId || 'unknown'),
+        validate: { xForwardedForHeader: false, default: false },
+        handler: (_req, res) => res.status(429).json({
+          status: 'rate_limited',
+          message: 'Too many messages sent. Please wait before sending more.',
+        }),
+      });
+
+      const harness = await makeApp(pool, { error() {} }, { ownerMessageLimiter: ownerLimiter });
+      t.after(() => harness.server.close());
+
+      // Owner 1 & Vehicle 1
+      const [u1] = await pool.query("INSERT INTO users (full_name, email, password_hash) VALUES ('RL Owner 1', 'rl1@parkx.ai', 'hash')");
+      const owner1Id = u1.insertId;
+      const owner1Cookie = await sessionFor(harness.base, owner1Id);
+      const [v1] = await pool.query("INSERT INTO vehicles (user_id, registration_number, vehicle_type, vehicle_model, color) VALUES (?, 'RL-OWNER-1', 'car', 'Model 3', 'Red')", [owner1Id]);
+
+      // Owner 2 & Vehicle 2
+      const [u2] = await pool.query("INSERT INTO users (full_name, email, password_hash) VALUES ('RL Owner 2', 'rl2@parkx.ai', 'hash')");
+      const owner2Id = u2.insertId;
+      const owner2Cookie = await sessionFor(harness.base, owner2Id);
+      const [v2] = await pool.query("INSERT INTO vehicles (user_id, registration_number, vehicle_type, vehicle_model, color) VALUES (?, 'RL-OWNER-2', 'car', 'Model Y', 'Blue')", [owner2Id]);
+
+      // Seed sessions
+      const sid1 = 'vs_' + randomBytes(24).toString('hex');
+      await pool.query(
+        "INSERT INTO visitor_sessions (public_id, vehicle_id, credential_hash, status, created_at, expires_at) VALUES (?, ?, 'hash1', 'pending', NOW(), NOW() + INTERVAL 24 HOUR)",
+        [sid1, v1.insertId]
+      );
+
+      const sid2 = 'vs_' + randomBytes(24).toString('hex');
+      await pool.query(
+        "INSERT INTO visitor_sessions (public_id, vehicle_id, credential_hash, status, created_at, expires_at) VALUES (?, ?, 'hash2', 'pending', NOW(), NOW() + INTERVAL 24 HOUR)",
+        [sid2, v2.insertId]
+      );
+
+      // Owner 1 sends reply 1 -> 201
+      const o1Res1 = await request(harness.base, owner1Cookie, 'POST', `/sessions/${sid1}/messages`, { body: 'Reply 1' });
+      assert.equal(o1Res1.status, 201);
+
+      // Owner 1 sends reply 2 -> 201
+      const o1Res2 = await request(harness.base, owner1Cookie, 'POST', `/sessions/${sid1}/messages`, { body: 'Reply 2' });
+      assert.equal(o1Res2.status, 201);
+
+      // Owner 1 sends reply 3 -> 429
+      const o1Res3 = await request(harness.base, owner1Cookie, 'POST', `/sessions/${sid1}/messages`, { body: 'Reply 3' });
+      assert.equal(o1Res3.status, 429);
+      const o1Data3 = await o1Res3.json();
+      assert.equal(o1Data3.status, 'rate_limited');
+
+      // Owner 2 is unaffected -> sends reply 1 -> 201
+      const o2Res1 = await request(harness.base, owner2Cookie, 'POST', `/sessions/${sid2}/messages`, { body: 'Owner 2 Reply 1' });
+      assert.equal(o2Res1.status, 201);
+
+      // Owner 1 can still read messages -> 200
+      const o1Read = await request(harness.base, owner1Cookie, 'GET', `/sessions/${sid1}/messages`, undefined, false);
+      assert.equal(o1Read.status, 200);
+
+      // Owner 1 can still close session -> 200
+      const o1Close = await request(harness.base, owner1Cookie, 'POST', `/sessions/${sid1}/close`, {});
+      assert.equal(o1Close.status, 200);
+    });
+  });
+
+  await t.test('real MySQL migration 009 verification: owner notifications, push subscriptions schema, and read cursor', async (t) => {
+    await withDatabase(t, async (pool) => {
+      await migrate(pool);
+      const conn = await pool.getConnection();
+      try {
+        // Schema verification passes on clean migration
+        await verifyOwnerNotificationsSchema(conn);
+
+        // Re-run migration is idempotent
+        await migrate(pool);
+        await verifyOwnerNotificationsSchema(conn);
+
+        // Verify push_subscriptions table columns
+        const [subCols] = await conn.query(
+          `SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+           FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'push_subscriptions'
+           ORDER BY ORDINAL_POSITION`
+        );
+        assert.equal(subCols.length, 7);
+
+        // Verify foreign key cascade and unique endpoint
+        const [userResult] = await pool.query(
+          "INSERT INTO users (full_name, email, password_hash) VALUES ('Push Owner', 'pushowner@example.test', 'hash')"
+        );
+        const ownerId = userResult.insertId;
+
+        const [vehicleResult] = await pool.query(
+          "INSERT INTO vehicles (user_id, registration_number, vehicle_type, vehicle_model, color) VALUES (?, 'PUSH123', 'car', 'Sedan', 'Blue')",
+          [ownerId]
+        );
+        const vehicleId = vehicleResult.insertId;
+
+        // Insert push subscription
+        await pool.query(
+          `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth)
+           VALUES (?, 'https://push.example.test/sub/1', 'key1', 'auth1')`,
+          [ownerId]
+        );
+
+        // Duplicate endpoint with ON DUPLICATE KEY UPDATE updates in place
+        await pool.query(
+          `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth)
+           VALUES (?, 'https://push.example.test/sub/1', 'key2', 'auth2')
+           ON DUPLICATE KEY UPDATE p256dh = VALUES(p256dh), auth = VALUES(auth)`,
+          [ownerId]
+        );
+
+        const [subs] = await pool.query(
+          'SELECT p256dh, auth FROM push_subscriptions WHERE endpoint = ?',
+          ['https://push.example.test/sub/1']
+        );
+        assert.equal(subs.length, 1);
+        assert.equal(subs[0].p256dh, 'key2');
+
+        // Test read cursor monotonicity on real MySQL 8.4
+        const [sessResult] = await pool.query(
+          `INSERT INTO visitor_sessions (public_id, vehicle_id, credential_hash, status, expires_at)
+           VALUES ('vs_000000000000000000000000000000000000000000000999', ?, REPEAT('a', 64), 'pending', DATE_ADD(NOW(), INTERVAL 1 DAY))`,
+          [vehicleId]
+        );
+        const sDbId = sessResult.insertId;
+
+        // Insert two visitor messages
+        const [m1] = await pool.query(
+          "INSERT INTO visitor_messages (session_id, sender_type, body) VALUES (?, 'visitor', 'msg1')",
+          [sDbId]
+        );
+        const [m2] = await pool.query(
+          "INSERT INTO visitor_messages (session_id, sender_type, body) VALUES (?, 'visitor', 'msg2')",
+          [sDbId]
+        );
+
+        // Advance cursor to m2.insertId
+        await pool.query(
+          `UPDATE visitor_sessions
+           SET owner_last_read_message_id = GREATEST(COALESCE(owner_last_read_message_id, 0), ?)
+           WHERE id = ?`,
+          [m2.insertId, sDbId]
+        );
+
+        const [sRow1] = await pool.query('SELECT owner_last_read_message_id FROM visitor_sessions WHERE id = ?', [sDbId]);
+        assert.equal(Number(sRow1[0].owner_last_read_message_id), m2.insertId);
+
+        // Attempt to regress cursor to m1.insertId (must remain at m2.insertId)
+        await pool.query(
+          `UPDATE visitor_sessions
+           SET owner_last_read_message_id = GREATEST(COALESCE(owner_last_read_message_id, 0), ?)
+           WHERE id = ?`,
+          [m1.insertId, sDbId]
+        );
+
+        const [sRow2] = await pool.query('SELECT owner_last_read_message_id FROM visitor_sessions WHERE id = ?', [sDbId]);
+        assert.equal(Number(sRow2[0].owner_last_read_message_id), m2.insertId);
+
+        // Deleting user cascades to push_subscriptions
+        await pool.query('DELETE FROM users WHERE id = ?', [ownerId]);
+        const [remainingSubs] = await pool.query(
+          'SELECT id FROM push_subscriptions WHERE endpoint = ?',
+          ['https://push.example.test/sub/1']
+        );
+        assert.equal(remainingSubs.length, 0, 'push_subscriptions must be deleted via ON DELETE CASCADE when user is deleted');
+      } finally {
+        conn.release();
+      }
     });
   });
 });
