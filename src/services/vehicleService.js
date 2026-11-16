@@ -125,3 +125,39 @@ export async function closeOwnerVisitorSession(sessionId) {
   });
   return readResponse(res, 'Failed to close contact session');
 }
+
+// ────────────────────────────────────────────────────────────
+// Owner Messaging (Phase 3.3)
+// ────────────────────────────────────────────────────────────
+
+export async function fetchOwnerSessionMessages(sessionId, { after = 0, limit = 50, signal } = {}) {
+  const params = new URLSearchParams();
+  if (after) params.set('after', String(after));
+  if (limit) params.set('limit', String(limit));
+  const qs = params.toString() ? `?${params.toString()}` : '';
+
+  const res = await fetch(`${API_BASE}/sessions/${encodeURIComponent(sessionId)}/messages${qs}`, {
+    method: 'GET',
+    credentials: 'include',
+    signal,
+  });
+  return readResponse(res, 'Failed to fetch messages');
+}
+
+export async function sendOwnerReply(sessionId, body, clientMessageId = null, { signal } = {}) {
+  const token = await csrfToken();
+  const payload = { body };
+  if (clientMessageId) payload.clientMessageId = clientMessageId;
+
+  const res = await fetch(`${API_BASE}/sessions/${encodeURIComponent(sessionId)}/messages`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-CSRF-Token': token,
+    },
+    body: JSON.stringify(payload),
+    signal,
+  });
+  return readResponse(res, 'Failed to send reply');
+}

@@ -47,6 +47,7 @@ export async function applyMigrations(pool, migrationDirectory = directory) {
         }
         if (file === '006_vehicle_qr_check_integrity.sql') await verifyStrictQrActiveConstraint(connection);
         if (file === '007_visitor_sessions.sql') await verifyVisitorSessionsSchema(connection);
+        if (file === '008_visitor_messages.sql') await verifyVisitorMessagesSchema(connection);
         continue;
       }
       if (file.startsWith('003_')) await assertNoNormalizedEmailDuplicates(connection);
@@ -64,6 +65,17 @@ export async function applyMigrations(pool, migrationDirectory = directory) {
             await connection.query(statement);
           }
           await verifyVisitorSessionsSchema(connection);
+        }
+      } else if (file === '008_visitor_messages.sql') {
+        const exists = await tableExists(connection, 'visitor_messages');
+        if (exists) {
+          await verifyVisitorMessagesSchema(connection);
+        } else {
+          const sql = (await readFile(path.join(migrationDirectory, file), 'utf8')).replace(/^\s*--.*$/gm, '');
+          for (const statement of sql.split(';').map((part) => part.trim()).filter(Boolean)) {
+            await connection.query(statement);
+          }
+          await verifyVisitorMessagesSchema(connection);
         }
       } else {
         const sql = (await readFile(path.join(migrationDirectory, file), 'utf8')).replace(/^\s*--.*$/gm, '');
@@ -781,6 +793,303 @@ export async function verifyVisitorSessionsSchema(connection) {
     !['NO ACTION', 'RESTRICT'].includes(validFk[0].UPDATE_RULE)
   ) {
     throw migration007Error('foreign key must be named fk_visitor_sessions_vehicle_id and reference vehicle_id to vehicles(id) with ON DELETE CASCADE.');
+  }
+}
+
+function migration008Error(message) {
+  return new Error(`Migration 008 schema inconsistency: ${message}`);
+}
+
+export async function verifyVisitorMessagesSchema(connection) {
+  const [tableRows] = await connection.query(
+    `SELECT TABLE_NAME, ENGINE, TABLE_COLLATION
+     FROM information_schema.TABLES
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'visitor_messages'`
+  );
+  if (!tableRows.length) {
+    throw migration008Error('visitor_messages table is missing from schema.');
+  }
+
+  const tableMeta = tableRows[0];
+  if (String(tableMeta.ENGINE).toUpperCase() !== 'INNODB') {
+    throw migration008Error(`visitor_messages table must use InnoDB storage engine, found ${tableMeta.ENGINE}.`);
+  }
+  if (tableMeta.TABLE_COLLATION !== 'utf8mb4_unicode_ci') {
+    throw migration008Error(`visitor_messages table must use utf8mb4_unicode_ci collation, found ${tableMeta.TABLE_COLLATION}.`);
+  }
+
+  const [cols] = await connection.query(
+    `SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA,
+            CHARACTER_SET_NAME, COLLATION_NAME, GENERATION_EXPRESSION
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'visitor_messages'
+     ORDER BY ORDINAL_POSITION`
+  );
+
+  if (cols.length !== 6) {
+    throw migration008Error(`visitor_messages table must contain exactly 6 columns, found ${cols.length}.`);
+  }
+
+  for (const c of cols) {
+    if (c.GENERATION_EXPRESSION) {
+      throw migration008Error(`column ${c.COLUMN_NAME} on visitor_messages must not be a generated column.`);
+    }
+    if (/\binvisible\b/i.test(c.EXTRA || '')) {
+      throw migration008Error(`column ${c.COLUMN_NAME} on visitor_messages must not be an invisible column.`);
+    }
+    if (/\b(?:virtual|stored)\b/i.test(c.EXTRA || '')) {
+      throw migration008Error(`column ${c.COLUMN_NAME} on visitor_messages must not be a generated column.`);
+    }
+    if (c.COLUMN_NAME !== 'id' && /\bauto_increment\b/i.test(c.EXTRA || '')) {
+      throw migration008Error(`column ${c.COLUMN_NAME} on visitor_messages must not be auto_increment.`);
+    }
+  }
+
+  const colMap = new Map(cols.map((c) => [c.COLUMN_NAME, c]));
+
+  // id: strictly BIGINT UNSIGNED, not null, auto_increment, no default
+  const idCol = colMap.get('id');
+  if (
+    !idCol ||
+    idCol.COLUMN_TYPE !== 'bigint unsigned' ||
+    idCol.IS_NULLABLE !== 'NO' ||
+    !idCol.EXTRA.includes('auto_increment') ||
+    idCol.COLUMN_DEFAULT !== null
+  ) {
+    throw migration008Error('invalid id column definition on visitor_messages: must be BIGINT UNSIGNED AUTO_INCREMENT.');
+  }
+
+  // session_id: strictly BIGINT UNSIGNED, not null, no default, no on update
+  const sessionIdCol = colMap.get('session_id');
+  if (
+    !sessionIdCol ||
+    sessionIdCol.COLUMN_TYPE !== 'bigint unsigned' ||
+    sessionIdCol.IS_NULLABLE !== 'NO' ||
+    sessionIdCol.COLUMN_DEFAULT !== null ||
+    sessionIdCol.EXTRA.includes('auto_increment') ||
+    /\bon update\b/i.test(sessionIdCol.EXTRA || '')
+  ) {
+    throw migration008Error('invalid session_id column definition on visitor_messages: must be BIGINT UNSIGNED NOT NULL.');
+  }
+
+  // sender_type: strictly ENUM('visitor','owner') NOT NULL, no default
+  const senderTypeCol = colMap.get('sender_type');
+  const exactSenderEnum = "enum('visitor','owner')";
+  if (
+    !senderTypeCol ||
+    senderTypeCol.COLUMN_TYPE !== exactSenderEnum ||
+    senderTypeCol.IS_NULLABLE !== 'NO' ||
+    senderTypeCol.COLUMN_DEFAULT !== null ||
+    /\bon update\b/i.test(senderTypeCol.EXTRA || '') ||
+    (senderTypeCol.CHARACTER_SET_NAME && senderTypeCol.CHARACTER_SET_NAME !== 'utf8mb4') ||
+    (senderTypeCol.COLLATION_NAME && senderTypeCol.COLLATION_NAME !== 'utf8mb4_unicode_ci')
+  ) {
+    throw migration008Error("invalid sender_type column definition on visitor_messages: must be ENUM('visitor','owner') NOT NULL with utf8mb4_unicode_ci collation.");
+  }
+
+  // body: strictly text, not null, utf8mb4_unicode_ci
+  const bodyCol = colMap.get('body');
+  if (
+    !bodyCol ||
+    bodyCol.COLUMN_TYPE !== 'text' ||
+    bodyCol.IS_NULLABLE !== 'NO' ||
+    bodyCol.COLUMN_DEFAULT !== null ||
+    /\bon update\b/i.test(bodyCol.EXTRA || '') ||
+    (bodyCol.CHARACTER_SET_NAME && bodyCol.CHARACTER_SET_NAME !== 'utf8mb4') ||
+    (bodyCol.COLLATION_NAME && bodyCol.COLLATION_NAME !== 'utf8mb4_unicode_ci')
+  ) {
+    throw migration008Error('invalid body column definition on visitor_messages: must be TEXT NOT NULL with utf8mb4_unicode_ci collation.');
+  }
+
+  // client_message_id: strictly VARCHAR(64) NULL DEFAULT NULL, utf8mb4_unicode_ci
+  const clientMsgIdCol = colMap.get('client_message_id');
+  if (
+    !clientMsgIdCol ||
+    clientMsgIdCol.COLUMN_TYPE !== 'varchar(64)' ||
+    clientMsgIdCol.IS_NULLABLE !== 'YES' ||
+    clientMsgIdCol.COLUMN_DEFAULT !== null ||
+    /\bon update\b/i.test(clientMsgIdCol.EXTRA || '') ||
+    (clientMsgIdCol.CHARACTER_SET_NAME && clientMsgIdCol.CHARACTER_SET_NAME !== 'utf8mb4') ||
+    (clientMsgIdCol.COLLATION_NAME && clientMsgIdCol.COLLATION_NAME !== 'utf8mb4_unicode_ci')
+  ) {
+    throw migration008Error('invalid client_message_id column definition on visitor_messages: must be VARCHAR(64) NULL DEFAULT NULL with utf8mb4_unicode_ci collation.');
+  }
+
+  // created_at: strictly TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP without ON UPDATE
+  const createdCol = colMap.get('created_at');
+  if (
+    !createdCol ||
+    createdCol.COLUMN_TYPE !== 'timestamp' ||
+    createdCol.IS_NULLABLE !== 'NO' ||
+    String(createdCol.COLUMN_DEFAULT ?? '').trim().toLowerCase() !== 'current_timestamp' ||
+    /\bon update\b/i.test(createdCol.EXTRA || '')
+  ) {
+    throw migration008Error('invalid created_at column definition on visitor_messages: must be TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP without ON UPDATE.');
+  }
+
+  // DDL checks via SHOW CREATE TABLE
+  const [createTableRows] = await connection.query('SHOW CREATE TABLE visitor_messages');
+  const createTableSql = createTableRows[0]?.['Create Table'] || '';
+
+  const extractColDdl = (colName) => {
+    const match = createTableSql.match(new RegExp(`^\\s*[\`"]?${colName}[\`"]?\\s+(.*?),?$`, 'm'));
+    return match ? match[1].trim() : null;
+  };
+
+  const idDdl = extractColDdl('id');
+  if (!idDdl || !/^bigint\s+unsigned\s+NOT\s+NULL\s+AUTO_INCREMENT$/i.test(idDdl) || /\bdefault\b/i.test(idDdl) || /\bon\s+update\b/i.test(idDdl) || /\binvisible\b/i.test(idDdl)) {
+    throw migration008Error('invalid id column definition on visitor_messages: must be BIGINT UNSIGNED NOT NULL AUTO_INCREMENT without defaults in DDL.');
+  }
+
+  const sessionIdDdl = extractColDdl('session_id');
+  if (!sessionIdDdl || !/^bigint\s+unsigned\s+NOT\s+NULL$/i.test(sessionIdDdl) || /\bdefault\b/i.test(sessionIdDdl) || /\bon\s+update\b/i.test(sessionIdDdl) || /\binvisible\b/i.test(sessionIdDdl)) {
+    throw migration008Error('invalid session_id column definition on visitor_messages: must be BIGINT UNSIGNED NOT NULL without defaults in DDL.');
+  }
+
+  const senderTypeDdl = extractColDdl('sender_type');
+  if (!senderTypeDdl || !/^enum\('visitor','owner'\)(?:\s+CHARACTER\s+SET\s+utf8mb4)?(?:\s+COLLATE\s+utf8mb4_unicode_ci)?\s+NOT\s+NULL$/i.test(senderTypeDdl) || /\bdefault\b/i.test(senderTypeDdl) || /\bon\s+update\b/i.test(senderTypeDdl) || /\binvisible\b/i.test(senderTypeDdl)) {
+    throw migration008Error("invalid sender_type column definition on visitor_messages: must be ENUM('visitor','owner') NOT NULL without defaults in DDL.");
+  }
+
+  const bodyDdl = extractColDdl('body');
+  if (!bodyDdl || !/^text(?:\s+CHARACTER\s+SET\s+utf8mb4)?(?:\s+COLLATE\s+utf8mb4_unicode_ci)?\s+NOT\s+NULL$/i.test(bodyDdl) || /\bdefault\b/i.test(bodyDdl) || /\bon\s+update\b/i.test(bodyDdl) || /\binvisible\b/i.test(bodyDdl)) {
+    throw migration008Error('invalid body column definition on visitor_messages: must be TEXT NOT NULL without defaults in DDL.');
+  }
+
+  const clientMsgIdDdl = extractColDdl('client_message_id');
+  if (!clientMsgIdDdl || !/^varchar\(64\)(?:\s+CHARACTER\s+SET\s+utf8mb4)?(?:\s+COLLATE\s+utf8mb4_unicode_ci)?\s+DEFAULT\s+NULL$/i.test(clientMsgIdDdl) || /\bon\s+update\b/i.test(clientMsgIdDdl) || /\binvisible\b/i.test(clientMsgIdDdl)) {
+    throw migration008Error('invalid client_message_id column definition on visitor_messages: must be VARCHAR(64) DEFAULT NULL in DDL.');
+  }
+
+  const createdDdl = extractColDdl('created_at');
+  if (!createdDdl || !/^timestamp\s+NOT\s+NULL\s+DEFAULT\s+CURRENT_TIMESTAMP$/i.test(createdDdl) || /\bon\s+update\b/i.test(createdDdl) || /\binvisible\b/i.test(createdDdl)) {
+    throw migration008Error('invalid created_at column definition on visitor_messages: must be TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP without ON UPDATE in DDL.');
+  }
+
+  // Indexes verification
+  const [indexes] = await connection.query(
+    `SELECT INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME, SUB_PART, INDEX_TYPE, IS_VISIBLE, COLLATION
+     FROM information_schema.STATISTICS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'visitor_messages'
+     ORDER BY INDEX_NAME, SEQ_IN_INDEX`
+  );
+
+  const indexGroups = new Map();
+  for (const idx of indexes) {
+    if (!indexGroups.has(idx.INDEX_NAME)) indexGroups.set(idx.INDEX_NAME, []);
+    indexGroups.get(idx.INDEX_NAME).push(idx);
+  }
+
+  const expectedIndexes = new Map([
+    [
+      'PRIMARY',
+      {
+        unique: true,
+        columns: ['id'],
+      },
+    ],
+    [
+      'idx_visitor_messages_session_id',
+      {
+        unique: false,
+        columns: ['session_id', 'id'],
+      },
+    ],
+    [
+      'uq_visitor_messages_client_id',
+      {
+        unique: true,
+        columns: ['session_id', 'sender_type', 'client_message_id'],
+      },
+    ],
+  ]);
+
+  for (const actualName of indexGroups.keys()) {
+    if (!expectedIndexes.has(actualName)) {
+      throw migration008Error(`unexpected extra index ${actualName} found on visitor_messages.`);
+    }
+  }
+
+  for (const expectedName of expectedIndexes.keys()) {
+    if (!indexGroups.has(expectedName)) {
+      throw migration008Error(`missing required index ${expectedName} on visitor_messages.`);
+    }
+  }
+
+  if (indexGroups.size !== expectedIndexes.size) {
+    throw migration008Error(`visitor_messages must have exactly ${expectedIndexes.size} indexes, found ${indexGroups.size}.`);
+  }
+
+  for (const [name, expected] of expectedIndexes.entries()) {
+    const actualCols = indexGroups.get(name);
+    if (!actualCols || actualCols.length !== expected.columns.length) {
+      throw migration008Error(`index ${name} on visitor_messages has incorrect column count: expected ${expected.columns.length}, found ${actualCols?.length}.`);
+    }
+    const isUnique = Number(actualCols[0].NON_UNIQUE) === 0;
+    if (isUnique !== expected.unique) {
+      throw migration008Error(`index ${name} on visitor_messages has incorrect uniqueness: expected unique=${expected.unique}.`);
+    }
+    for (let i = 0; i < expected.columns.length; i++) {
+      const col = actualCols[i];
+      if (col.COLUMN_NAME !== expected.columns[i]) {
+        throw migration008Error(`index ${name} column at position ${i + 1} must be ${expected.columns[i]}, found ${col.COLUMN_NAME}.`);
+      }
+      if (Number(col.SEQ_IN_INDEX) !== i + 1) {
+        throw migration008Error(`index ${name} column ${expected.columns[i]} has incorrect sequence position.`);
+      }
+      if (col.SUB_PART !== null && col.SUB_PART !== undefined) {
+        throw migration008Error(`index ${name} must be a full-column index; prefix index (sub_part=${col.SUB_PART}) is rejected.`);
+      }
+      if (String(col.IS_VISIBLE).toUpperCase() !== 'YES') {
+        throw migration008Error(`index ${name} on visitor_messages is invisible; all migration 008 indexes must be visible.`);
+      }
+      if (String(col.INDEX_TYPE).toUpperCase() !== 'BTREE') {
+        throw migration008Error(`index ${name} on visitor_messages must have INDEX_TYPE BTREE.`);
+      }
+      if (col.COLLATION !== 'A') {
+        throw migration008Error(`index ${name} column ${expected.columns[i]} must have ascending direction ('A'), found '${col.COLLATION}'.`);
+      }
+    }
+  }
+
+  // Foreign key verification
+  const [schemaRows] = await connection.query('SELECT DATABASE() AS schemaName');
+  const currentSchema = schemaRows[0]?.schemaName;
+  const [fks] = await connection.query(
+    `SELECT tc.CONSTRAINT_NAME, kcu.COLUMN_NAME, kcu.ORDINAL_POSITION,
+            kcu.REFERENCED_TABLE_SCHEMA, kcu.REFERENCED_TABLE_NAME,
+            kcu.REFERENCED_COLUMN_NAME, rc.DELETE_RULE, rc.UPDATE_RULE
+     FROM information_schema.TABLE_CONSTRAINTS tc
+     JOIN information_schema.KEY_COLUMN_USAGE kcu
+       ON kcu.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
+      AND kcu.TABLE_NAME = tc.TABLE_NAME
+      AND kcu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+     JOIN information_schema.REFERENTIAL_CONSTRAINTS rc
+       ON rc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
+      AND rc.TABLE_NAME = tc.TABLE_NAME
+      AND rc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+    WHERE tc.CONSTRAINT_SCHEMA = DATABASE()
+      AND tc.TABLE_NAME = 'visitor_messages'
+      AND tc.CONSTRAINT_TYPE = 'FOREIGN KEY'`
+  );
+
+  const fkGroups = new Map();
+  for (const fk of fks) {
+    if (!fkGroups.has(fk.CONSTRAINT_NAME)) fkGroups.set(fk.CONSTRAINT_NAME, []);
+    fkGroups.get(fk.CONSTRAINT_NAME).push(fk);
+  }
+  const validFk = fkGroups.size === 1 ? [...fkGroups.values()][0] : null;
+  if (
+    !validFk || validFk.length !== 1 ||
+    validFk[0].CONSTRAINT_NAME !== 'fk_visitor_messages_session_id' ||
+    validFk[0].COLUMN_NAME !== 'session_id' || Number(validFk[0].ORDINAL_POSITION) !== 1 ||
+    validFk[0].REFERENCED_TABLE_SCHEMA !== currentSchema ||
+    validFk[0].REFERENCED_TABLE_NAME !== 'visitor_sessions' ||
+    validFk[0].REFERENCED_COLUMN_NAME !== 'id' ||
+    validFk[0].DELETE_RULE !== 'CASCADE' ||
+    !['NO ACTION', 'RESTRICT'].includes(validFk[0].UPDATE_RULE)
+  ) {
+    throw migration008Error('foreign key must be named fk_visitor_messages_session_id and reference session_id to visitor_sessions(id) with ON DELETE CASCADE.');
   }
 }
 

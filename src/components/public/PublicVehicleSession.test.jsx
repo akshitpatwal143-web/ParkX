@@ -11,6 +11,8 @@ vi.mock('../../services/publicService', () => ({
   createVisitorSession: vi.fn(),
   getVisitorSession: vi.fn(),
   closeVisitorSession: vi.fn(),
+  sendVisitorMessage: vi.fn(),
+  fetchVisitorMessages: vi.fn(),
 }));
 
 import {
@@ -21,6 +23,8 @@ import {
   createVisitorSession,
   getVisitorSession,
   closeVisitorSession,
+  sendVisitorMessage,
+  fetchVisitorMessages,
 } from '../../services/publicService';
 import PublicVehicleView from './PublicVehicleView';
 
@@ -38,6 +42,7 @@ describe('PublicVehicleView — Anonymous Visitor Sessions (Phase 3.2)', () => {
       status: 'valid',
       vehicle: testVehicle,
     });
+    fetchVisitorMessages.mockResolvedValue({ status: 'ok', messages: [] });
   });
 
   afterEach(() => {
@@ -263,5 +268,110 @@ describe('PublicVehicleView — Anonymous Visitor Sessions (Phase 3.2)', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('Phase 3.3: Visitor can send a message immediately while session is pending', async () => {
+    const storedSession = {
+      sessionId: 'vs_msg_test_12345678901234567890',
+      visitorCredential: 'vcred_' + 'm'.repeat(64),
+      status: 'pending',
+      expiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
+    };
+    getStoredVisitorSession.mockReturnValue(storedSession);
+    getVisitorSession.mockResolvedValue({
+      status: 'pending',
+      sessionId: storedSession.sessionId,
+      expiresAt: storedSession.expiresAt,
+    });
+    fetchVisitorMessages.mockResolvedValueOnce({
+      status: 'ok',
+      messages: [],
+    });
+    sendVisitorMessage.mockResolvedValueOnce({
+      status: 'sent',
+      message: {
+        id: 1,
+        senderType: 'visitor',
+        body: 'Hello owner, your vehicle is blocking driveway 4.',
+        createdAt: new Date().toISOString(),
+      },
+    });
+
+    render(<PublicVehicleView token={testToken} onNavigateHome={() => {}} />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Contact Request Pending/i)).toBeTruthy();
+      expect(screen.getByPlaceholderText(/Type a message for the vehicle owner/i)).toBeTruthy();
+    });
+
+    const textarea = screen.getByPlaceholderText(/Type a message for the vehicle owner/i);
+    const sendBtn = screen.getByRole('button', { name: /^Send$/i });
+
+    // Send button disabled when empty
+    expect(sendBtn.hasAttribute('disabled')).toBe(true);
+
+    // Type message
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: 'Hello owner, your vehicle is blocking driveway 4.' } });
+    });
+
+    // Character counter should update (49 chars)
+    expect(screen.getByText(/49 \/ 2000/i)).toBeTruthy();
+    expect(sendBtn.hasAttribute('disabled')).toBe(false);
+
+    // Click send
+    await act(async () => {
+      fireEvent.click(sendBtn);
+    });
+
+    await waitFor(() => {
+      expect(sendVisitorMessage).toHaveBeenCalledWith(
+        storedSession.sessionId,
+        storedSession.visitorCredential,
+        'Hello owner, your vehicle is blocking driveway 4.',
+        expect.any(String)
+      );
+      expect(screen.getByText('Hello owner, your vehicle is blocking driveway 4.')).toBeTruthy();
+    });
+  });
+
+  it('Phase 3.3: Renders chronological messages from both visitor and owner', async () => {
+    const storedSession = {
+      sessionId: 'vs_chrono_12345678901234567890',
+      visitorCredential: 'vcred_' + 'c'.repeat(64),
+      status: 'accepted',
+      expiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
+    };
+    getStoredVisitorSession.mockReturnValue(storedSession);
+    getVisitorSession.mockResolvedValue({
+      status: 'accepted',
+      sessionId: storedSession.sessionId,
+      expiresAt: storedSession.expiresAt,
+    });
+    fetchVisitorMessages.mockResolvedValue({
+      status: 'ok',
+      messages: [
+        {
+          id: 1,
+          senderType: 'visitor',
+          body: 'First message from visitor',
+          createdAt: '2026-03-01T10:00:00.000Z',
+        },
+        {
+          id: 2,
+          senderType: 'owner',
+          body: 'Reply from vehicle owner',
+          createdAt: '2026-03-01T10:01:00.000Z',
+        },
+      ],
+    });
+
+    render(<PublicVehicleView token={testToken} onNavigateHome={() => {}} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('First message from visitor')).toBeTruthy();
+      expect(screen.getByText('Reply from vehicle owner')).toBeTruthy();
+      expect(screen.getAllByText(/Vehicle Owner/i).length).toBeGreaterThan(0);
+    });
   });
 });

@@ -23,11 +23,13 @@ import {
 } from '../../services/vehicleService';
 import AddVehicle from './AddVehicle';
 import VehicleDetails from './VehicleDetails';
+import OwnerConversationModal from './OwnerConversationModal';
 
 export default function Vehicles() {
   const [vehicles, setVehicles] = useState([]);
   const [sessions, setSessions] = useState([]);
   const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [activeConversationSession, setActiveConversationSession] = useState(null);
   const [activeTab, setActiveTab] = useState('vehicles'); // 'vehicles' | 'requests'
   const [actionLoadingId, setActionLoadingId] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -443,19 +445,41 @@ export default function Vehicles() {
                         <span>{new Date(s.createdAt).toLocaleString()}</span>
                       </div>
 
+                      {s.lastMessage && (
+                        <div className="bg-white/[0.02] border border-white/[0.04] rounded-lg p-2.5 space-y-1">
+                          <div className="flex items-center justify-between text-[10px] text-neutral-400">
+                            <span className="font-semibold text-neutral-300">
+                              {s.lastMessage.senderType === 'owner' ? 'You' : 'Visitor'}:
+                            </span>
+                            <span>{new Date(s.lastMessage.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                          </div>
+                          <p className="text-neutral-300 truncate text-[11px]">
+                            {s.lastMessage.body}
+                          </p>
+                        </div>
+                      )}
+
                       <div className="flex items-center space-x-2 pt-1">
+                        <button
+                          onClick={() => setActiveConversationSession(s)}
+                          className="flex-1 inline-flex items-center justify-center space-x-1.5 py-2 rounded border border-[#2ee6ca]/30 bg-[#2ee6ca]/10 hover:bg-[#2ee6ca]/20 text-[#2ee6ca] font-semibold uppercase text-xs tracking-wider transition-colors"
+                        >
+                          <MessageSquare className="w-3.5 h-3.5" />
+                          <span>Conversation {s.messageCount > 0 ? `(${s.messageCount})` : ''}</span>
+                        </button>
+
                         {s.status === 'pending' && (
                           <button
                             onClick={() => handleAcceptSession(s.sessionId)}
                             disabled={actionLoadingId === s.sessionId}
-                            className="flex-1 inline-flex items-center justify-center space-x-1.5 py-2 rounded bg-[#2ee6ca] hover:bg-[#28d1b7] text-black font-semibold uppercase text-xs tracking-wider transition-colors disabled:opacity-50"
+                            className="inline-flex items-center justify-center space-x-1 px-3 py-2 rounded bg-[#2ee6ca] hover:bg-[#28d1b7] text-black font-semibold uppercase text-xs tracking-wider transition-colors disabled:opacity-50"
                           >
                             {actionLoadingId === s.sessionId ? (
                               <Loader2 className="w-3.5 h-3.5 animate-spin" />
                             ) : (
                               <CheckCircle className="w-3.5 h-3.5" />
                             )}
-                            <span>Accept Request</span>
+                            <span className="hidden sm:inline">Accept</span>
                           </button>
                         )}
 
@@ -463,14 +487,14 @@ export default function Vehicles() {
                           <button
                             onClick={() => handleCloseSession(s.sessionId)}
                             disabled={actionLoadingId === s.sessionId}
-                            className="inline-flex items-center justify-center space-x-1.5 px-3 py-2 rounded border border-red-500/20 bg-red-500/10 hover:bg-red-500/20 text-red-400 uppercase text-xs tracking-wider transition-colors disabled:opacity-50"
+                            className="inline-flex items-center justify-center space-x-1 px-3 py-2 rounded border border-red-500/20 bg-red-500/10 hover:bg-red-500/20 text-red-400 uppercase text-xs tracking-wider transition-colors disabled:opacity-50"
                           >
                             {actionLoadingId === s.sessionId ? (
                               <Loader2 className="w-3.5 h-3.5 animate-spin" />
                             ) : (
                               <XCircle className="w-3.5 h-3.5" />
                             )}
-                            <span>Close</span>
+                            <span className="hidden sm:inline">Close</span>
                           </button>
                         )}
                       </div>
@@ -481,6 +505,24 @@ export default function Vehicles() {
             </div>
           )}
         </div>
+      )}
+
+      {/* Owner Conversation Modal (Phase 3.3) */}
+      {activeConversationSession && (
+        <OwnerConversationModal
+          sessionId={activeConversationSession.sessionId}
+          session={activeConversationSession}
+          onClose={() => {
+            setActiveConversationSession(null);
+            loadSessions();
+          }}
+          onSessionUpdated={(updated) => {
+            setSessions((prev) =>
+              prev.map((item) => (item.sessionId === updated.sessionId ? { ...item, ...updated } : item))
+            );
+            setActiveConversationSession((prev) => (prev ? { ...prev, ...updated } : prev));
+          }}
+        />
       )}
     </div>
   );
