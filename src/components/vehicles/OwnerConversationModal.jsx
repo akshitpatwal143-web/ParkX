@@ -16,6 +16,7 @@ import {
   sendOwnerReply,
   acceptVisitorSession,
   closeOwnerVisitorSession,
+  markSessionAsRead,
 } from '../../services/vehicleService';
 
 export default function OwnerConversationModal({
@@ -63,6 +64,14 @@ export default function OwnerConversationModal({
       if (fetched.length > 0) {
         latestMessageIdRef.current = Math.max(...fetched.map((m) => Number(m.id) || 0));
       }
+      // Auto-mark conversation as read on open
+      markSessionAsRead(effectiveSessionId)
+        .then(() => {
+          if (onSessionUpdated) {
+            onSessionUpdated({ sessionId: effectiveSessionId, unreadCount: 0 });
+          }
+        })
+        .catch(() => {});
     } catch (err) {
       setError(err.message || 'Failed to load conversation history');
     } finally {
@@ -119,6 +128,19 @@ export default function OwnerConversationModal({
             if (fresh.length === 0) return prev;
             const updated = [...prev, ...fresh];
             latestMessageIdRef.current = Math.max(...updated.map((m) => Number(m.id) || 0));
+
+            // If fresh visitor message received while viewing conversation, auto mark as read
+            const hasVisitorMsg = fresh.some((m) => m.senderType === 'visitor');
+            if (hasVisitorMsg) {
+              markSessionAsRead(effectiveSessionId)
+                .then(() => {
+                  if (onSessionUpdated) {
+                    onSessionUpdated({ sessionId: effectiveSessionId, unreadCount: 0 });
+                  }
+                })
+                .catch(() => {});
+            }
+
             return updated;
           });
           scrollToBottom();

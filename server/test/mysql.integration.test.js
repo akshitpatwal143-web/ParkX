@@ -5,7 +5,7 @@ import express from 'express';
 import session from 'express-session';
 import rateLimit from 'express-rate-limit';
 import mysql from 'mysql2/promise';
-import { applyMigrations, verifyVisitorSessionsSchema, verifyVisitorMessagesSchema } from '../src/migrate.js';
+import { applyMigrations, verifyVisitorSessionsSchema, verifyVisitorMessagesSchema, verifyOwnerNotificationsSchema } from '../src/migrate.js';
 import { createVehiclesRouter } from '../src/routes/vehicles.js';
 import { createPublicRouter } from '../src/routes/public.js';
 import { runVisitorSessionCleanup } from '../src/services/sessionCleanup.js';
@@ -2398,6 +2398,114 @@ test('MySQL migration and vehicle integrity integration', { skip: !enabled }, as
       // Owner 1 can still close session -> 200
       const o1Close = await request(harness.base, owner1Cookie, 'POST', `/sessions/${sid1}/close`, {});
       assert.equal(o1Close.status, 200);
+    });
+  });
+
+  await t.test('real MySQL migration 009 verification: owner notifications, push subscriptions schema, and read cursor', async (t) => {
+    await withDatabase(t, async (pool) => {
+      await migrate(pool);
+      const conn = await pool.getConnection();
+      try {
+        // Schema verification passes on clean migration
+        await verifyOwnerNotificationsSchema(conn);
+
+        // Re-run migration is idempotent
+        await migrate(pool);
+        await verifyOwnerNotificationsSchema(conn);
+
+        // Verify push_subscriptions table columns
+        const [subCols] = await conn.query(
+          `SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+           FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'push_subscriptions'
+           ORDER BY ORDINAL_POSITION`
+        );
+        assert.equal(subCols.length, 7);
+
+        // Verify foreign key cascade and unique endpoint
+        const [userResult] = await pool.query(
+          "INSERT INTO users (full_name, email, password_hash) VALUES ('Push Owner', 'pushowner@example.test', 'hash')"
+        );
+        const ownerId = userResult.insertId;
+
+        const [vehicleResult] = await pool.query(
+          "INSERT INTO vehicles (user_id, registration_number, vehicle_type, vehicle_model, color) VALUES (?, 'PUSH123', 'car', 'Sedan', 'Blue')",
+          [ownerId]
+        );
+        const vehicleId = vehicleResult.insertId;
+
+        // Insert push subscription
+        await pool.query(
+          `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth)
+           VALUES (?, 'https://push.example.test/sub/1', 'key1', 'auth1')`,
+          [ownerId]
+        );
+
+        // Duplicate endpoint with ON DUPLICATE KEY UPDATE updates in place
+        await pool.query(
+          `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth)
+           VALUES (?, 'https://push.example.test/sub/1', 'key2', 'auth2')
+           ON DUPLICATE KEY UPDATE p256dh = VALUES(p256dh), auth = VALUES(auth)`,
+          [ownerId]
+        );
+
+        const [subs] = await pool.query(
+          'SELECT p256dh, auth FROM push_subscriptions WHERE endpoint = ?',
+          ['https://push.example.test/sub/1']
+        );
+        assert.equal(subs.length, 1);
+        assert.equal(subs[0].p256dh, 'key2');
+
+        // Test read cursor monotonicity on real MySQL 8.4
+        const [sessResult] = await pool.query(
+          `INSERT INTO visitor_sessions (public_id, vehicle_id, credential_hash, status, expires_at)
+           VALUES ('vs_000000000000000000000000000000000000000000000999', ?, REPEAT('a', 64), 'pending', DATE_ADD(NOW(), INTERVAL 1 DAY))`,
+          [vehicleId]
+        );
+        const sDbId = sessResult.insertId;
+
+        // Insert two visitor messages
+        const [m1] = await pool.query(
+          "INSERT INTO visitor_messages (session_id, sender_type, body) VALUES (?, 'visitor', 'msg1')",
+          [sDbId]
+        );
+        const [m2] = await pool.query(
+          "INSERT INTO visitor_messages (session_id, sender_type, body) VALUES (?, 'visitor', 'msg2')",
+          [sDbId]
+        );
+
+        // Advance cursor to m2.insertId
+        await pool.query(
+          `UPDATE visitor_sessions
+           SET owner_last_read_message_id = GREATEST(COALESCE(owner_last_read_message_id, 0), ?)
+           WHERE id = ?`,
+          [m2.insertId, sDbId]
+        );
+
+        const [sRow1] = await pool.query('SELECT owner_last_read_message_id FROM visitor_sessions WHERE id = ?', [sDbId]);
+        assert.equal(Number(sRow1[0].owner_last_read_message_id), m2.insertId);
+
+        // Attempt to regress cursor to m1.insertId (must remain at m2.insertId)
+        await pool.query(
+          `UPDATE visitor_sessions
+           SET owner_last_read_message_id = GREATEST(COALESCE(owner_last_read_message_id, 0), ?)
+           WHERE id = ?`,
+          [m1.insertId, sDbId]
+        );
+
+        const [sRow2] = await pool.query('SELECT owner_last_read_message_id FROM visitor_sessions WHERE id = ?', [sDbId]);
+        assert.equal(Number(sRow2[0].owner_last_read_message_id), m2.insertId);
+
+        // Deleting user cascades to push_subscriptions
+        await pool.query('DELETE FROM users WHERE id = ?', [ownerId]);
+        const [remainingSubs] = await pool.query(
+          'SELECT id FROM push_subscriptions WHERE endpoint = ?',
+          ['https://push.example.test/sub/1']
+        );
+        assert.equal(remainingSubs.length, 0, 'push_subscriptions must be deleted via ON DELETE CASCADE when user is deleted');
+      } finally {
+        conn.release();
+      }
     });
   });
 });

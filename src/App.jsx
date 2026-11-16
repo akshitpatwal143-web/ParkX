@@ -100,13 +100,14 @@ function MainLayout() {
     return () => window.removeEventListener('popstate', handlePopState);
   }, []);
 
-  const handleNavigateView = (view) => {
+  const handleNavigateView = (view, options = {}) => {
     if (view === 'garage') {
       if (!user && !isInitializing) {
         openLogin();
         return;
       }
-      window.history.pushState({}, '', '/vehicles');
+      const qs = options.openSessionId ? `?openSession=${encodeURIComponent(options.openSessionId)}` : '';
+      window.history.pushState({}, '', `/vehicles${qs}`);
       syncThirdPartyFontPolicy('/vehicles');
       setCurrentView('garage');
       window.scrollTo({ top: 0, behavior: 'smooth' });

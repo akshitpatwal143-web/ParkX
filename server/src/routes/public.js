@@ -3,6 +3,7 @@ import { Router } from 'express';
 import rateLimit from 'express-rate-limit';
 import { sanitizeDbErrorCode } from '../db.js';
 import { wrapAsyncHandler } from '../asyncHandler.js';
+import { sendPushNotificationForSession } from '../services/pushNotification.js';
 
 const TOKEN_REGEX = /^pkx_[0-9a-fA-F]{64}$/;
 const SESSION_ID_REGEX = /^vs_[0-9a-fA-F]{40,64}$/;
@@ -701,7 +702,7 @@ export function createPublicRouter({ pool, limiter, sessionCreateLimiter, sessio
       await connection.beginTransaction();
 
       const [rows] = await connection.query(
-        `SELECT id, public_id, credential_hash, status, expires_at
+        `SELECT id, public_id, vehicle_id, credential_hash, status, expires_at
          FROM visitor_sessions
          WHERE public_id = ?
          FOR UPDATE`,
@@ -783,6 +784,18 @@ export function createPublicRouter({ pool, limiter, sessionCreateLimiter, sessio
 
           await connection.commit();
 
+          // Asynchronously dispatch push notification to vehicle owner (fire-and-forget, never fails response)
+          if (sessionRow.vehicle_id) {
+            sendPushNotificationForSession({
+              pool,
+              vehicleId: sessionRow.vehicle_id,
+              sessionId: sessionRow.public_id,
+              logger,
+            }).catch((pushErr) => {
+              if (logger?.error) logger.error('Failed to dispatch push notification', { error: pushErr?.message });
+            });
+          }
+
           return res.status(201).json({
             status: 'sent',
             message: {
@@ -831,6 +844,18 @@ export function createPublicRouter({ pool, limiter, sessionCreateLimiter, sessio
       );
 
       await connection.commit();
+
+      // Asynchronously dispatch push notification to vehicle owner (fire-and-forget, never fails response)
+      if (sessionRow.vehicle_id) {
+        sendPushNotificationForSession({
+          pool,
+          vehicleId: sessionRow.vehicle_id,
+          sessionId: sessionRow.public_id,
+          logger,
+        }).catch((pushErr) => {
+          if (logger?.error) logger.error('Failed to dispatch push notification', { error: pushErr?.message });
+        });
+      }
 
       return res.status(201).json({
         status: 'sent',

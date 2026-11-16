@@ -140,6 +140,8 @@ function ownerSessionDTO(row) {
       color: row.color,
     },
     messageCount: Number(row.message_count || 0),
+    unreadCount: Number(row.unread_count || 0),
+    ownerLastReadMessageId: row.owner_last_read_message_id ? Number(row.owner_last_read_message_id) : null,
     lastMessage: row.last_message_body ? {
       body: row.last_message_body,
       senderType: row.last_message_sender,
@@ -323,11 +325,13 @@ export function createVehiclesRouter({ pool, origins, logger = console, ownerMes
 
       let query = `
         SELECT s.id, s.public_id, s.vehicle_id, s.status, s.created_at, s.expires_at, s.accepted_at, s.closed_at,
+               s.owner_last_read_message_id,
                v.registration_number, v.vehicle_type, v.vehicle_model, v.color,
                lm.body AS last_message_body,
                lm.sender_type AS last_message_sender,
                lm.created_at AS last_message_created_at,
-               COALESCE(mc.msg_count, 0) AS message_count
+               COALESCE(mc.msg_count, 0) AS message_count,
+               COALESCE(uc.unread_count, 0) AS unread_count
         FROM visitor_sessions s
         JOIN vehicles v ON v.id = s.vehicle_id
         LEFT JOIN (
@@ -335,6 +339,14 @@ export function createVehiclesRouter({ pool, origins, logger = console, ownerMes
           FROM visitor_messages
           GROUP BY session_id
         ) mc ON mc.session_id = s.id
+        LEFT JOIN (
+          SELECT vm.session_id, COUNT(*) AS unread_count
+          FROM visitor_messages vm
+          JOIN visitor_sessions vs ON vs.id = vm.session_id
+          WHERE vm.sender_type = 'visitor'
+            AND (vs.owner_last_read_message_id IS NULL OR vm.id > vs.owner_last_read_message_id)
+          GROUP BY vm.session_id
+        ) uc ON uc.session_id = s.id
         LEFT JOIN (
           SELECT m1.session_id, m1.body, m1.sender_type, m1.created_at
           FROM visitor_messages m1
@@ -361,6 +373,140 @@ export function createVehiclesRouter({ pool, origins, logger = console, ownerMes
 
       const [rows] = await pool.query(query, params);
       return res.json({ sessions: rows.map(ownerSessionDTO) });
+    } catch (error) {
+      return sendError(res, error, logger);
+    }
+  }));
+
+  // ────────────────────────────────────────────────────────────
+  // GET /api/vehicles/notifications — Retrieve unread message summary
+  // ────────────────────────────────────────────────────────────
+  router.get('/notifications', wrapAsyncHandler(async (req, res) => {
+    try {
+      const userId = req.session.userId;
+      const [rows] = await pool.query(
+        `SELECT s.id, s.public_id AS session_id, s.vehicle_id, s.status, s.expires_at,
+                v.registration_number, v.vehicle_type, v.vehicle_model,
+                COALESCE(uc.unread_count, 0) AS unread_count,
+                uc.latest_unread_at
+         FROM visitor_sessions s
+         JOIN vehicles v ON v.id = s.vehicle_id
+         JOIN (
+           SELECT vm.session_id,
+                  COUNT(*) AS unread_count,
+                  MAX(vm.created_at) AS latest_unread_at
+           FROM visitor_messages vm
+           JOIN visitor_sessions vs ON vs.id = vm.session_id
+           WHERE vm.sender_type = 'visitor'
+             AND (vs.owner_last_read_message_id IS NULL OR vm.id > vs.owner_last_read_message_id)
+           GROUP BY vm.session_id
+         ) uc ON uc.session_id = s.id
+         WHERE v.user_id = ? AND uc.unread_count > 0
+         ORDER BY uc.latest_unread_at DESC`,
+        [userId]
+      );
+
+      let totalUnreadCount = 0;
+      const unreadSessions = rows.map((r) => {
+        const count = Number(r.unread_count || 0);
+        totalUnreadCount += count;
+        const isPastExpiry = r.status !== 'closed' && new Date(r.expires_at).getTime() <= Date.now();
+        const effectiveStatus = isPastExpiry ? 'expired' : r.status;
+        return {
+          sessionId: r.session_id,
+          vehicleId: r.vehicle_id,
+          registrationNumber: r.registration_number,
+          vehicleType: r.vehicle_type,
+          vehicleModel: r.vehicle_model,
+          status: effectiveStatus,
+          unreadCount: count,
+          lastMessageAt: r.latest_unread_at,
+        };
+      });
+
+      return res.json({
+        totalUnreadCount,
+        sessions: unreadSessions,
+      });
+    } catch (error) {
+      return sendError(res, error, logger);
+    }
+  }));
+
+  // ────────────────────────────────────────────────────────────
+  // POST /api/vehicles/sessions/:sessionId/read — Mark conversation as read
+  // ────────────────────────────────────────────────────────────
+  router.post('/sessions/:sessionId/read', csrf, wrapAsyncHandler(async (req, res) => {
+    try {
+      const userId = req.session.userId;
+      const sessionId = req.params.sessionId;
+      if (!sessionId || !SESSION_ID_REGEX.test(sessionId)) {
+        return res.status(400).json({ message: 'Invalid session ID format' });
+      }
+
+      const [sessions] = await pool.query(
+        `SELECT s.id, s.public_id, s.owner_last_read_message_id
+         FROM visitor_sessions s
+         JOIN vehicles v ON v.id = s.vehicle_id
+         WHERE s.public_id = ? AND v.user_id = ?
+         LIMIT 1`,
+        [sessionId, userId]
+      );
+
+      if (!sessions || sessions.length === 0) {
+        return res.status(404).json({ message: 'Session not found' });
+      }
+
+      const sessionRow = sessions[0];
+
+      const [maxRows] = await pool.query(
+        `SELECT COALESCE(MAX(id), 0) AS max_id
+         FROM visitor_messages
+         WHERE session_id = ?`,
+        [sessionRow.id]
+      );
+      const maxId = Number(maxRows[0]?.max_id || 0);
+
+      let targetId = maxId;
+      if (req.body?.messageId !== undefined && req.body?.messageId !== null) {
+        const parsed = Number(req.body.messageId);
+        if (Number.isInteger(parsed) && parsed > 0) {
+          targetId = Math.min(parsed, maxId);
+        }
+      }
+
+      if (targetId > 0) {
+        await pool.query(
+          `UPDATE visitor_sessions
+           SET owner_last_read_message_id = GREATEST(COALESCE(owner_last_read_message_id, 0), ?)
+           WHERE id = ?`,
+          [targetId, sessionRow.id]
+        );
+      }
+
+      const [updatedRows] = await pool.query(
+        `SELECT s.owner_last_read_message_id,
+                COALESCE((
+                  SELECT COUNT(*)
+                  FROM visitor_messages vm
+                  WHERE vm.session_id = s.id
+                    AND vm.sender_type = 'visitor'
+                    AND (s.owner_last_read_message_id IS NULL OR vm.id > s.owner_last_read_message_id)
+                ), 0) AS unread_count
+         FROM visitor_sessions s
+         WHERE s.id = ?`,
+        [sessionRow.id]
+      );
+
+      const updatedRow = updatedRows[0];
+      return res.json({
+        status: 'ok',
+        sessionId,
+        unreadCount: Number(updatedRow?.unread_count || 0),
+        ownerLastReadMessageId: updatedRow?.owner_last_read_message_id
+          ? Number(updatedRow.owner_last_read_message_id)
+          : null,
+      });
     } catch (error) {
       return sendError(res, error, logger);
     }
@@ -919,9 +1065,37 @@ export function createVehiclesRouter({ pool, origins, logger = console, ownerMes
 
       const [rows] = await pool.query(
         `SELECT s.id, s.public_id, s.vehicle_id, s.status, s.created_at, s.expires_at, s.accepted_at, s.closed_at,
-                v.registration_number, v.vehicle_type, v.vehicle_model, v.color
+                s.owner_last_read_message_id,
+                v.registration_number, v.vehicle_type, v.vehicle_model, v.color,
+                lm.body AS last_message_body,
+                lm.sender_type AS last_message_sender,
+                lm.created_at AS last_message_created_at,
+                COALESCE(mc.msg_count, 0) AS message_count,
+                COALESCE(uc.unread_count, 0) AS unread_count
          FROM visitor_sessions s
          JOIN vehicles v ON v.id = s.vehicle_id
+         LEFT JOIN (
+           SELECT session_id, COUNT(*) AS msg_count
+           FROM visitor_messages
+           GROUP BY session_id
+         ) mc ON mc.session_id = s.id
+         LEFT JOIN (
+           SELECT vm.session_id, COUNT(*) AS unread_count
+           FROM visitor_messages vm
+           JOIN visitor_sessions vs ON vs.id = vm.session_id
+           WHERE vm.sender_type = 'visitor'
+             AND (vs.owner_last_read_message_id IS NULL OR vm.id > vs.owner_last_read_message_id)
+           GROUP BY vm.session_id
+         ) uc ON uc.session_id = s.id
+         LEFT JOIN (
+           SELECT m1.session_id, m1.body, m1.sender_type, m1.created_at
+           FROM visitor_messages m1
+           JOIN (
+             SELECT session_id, MAX(id) AS max_id
+             FROM visitor_messages
+             GROUP BY session_id
+           ) m2 ON m1.id = m2.max_id
+         ) lm ON lm.session_id = s.id
          WHERE s.vehicle_id = ? AND v.user_id = ?
          ORDER BY s.created_at DESC LIMIT 50`,
         [vehicleId, userId]

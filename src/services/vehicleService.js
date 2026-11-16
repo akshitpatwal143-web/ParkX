@@ -161,3 +161,35 @@ export async function sendOwnerReply(sessionId, body, clientMessageId = null, { 
   });
   return readResponse(res, 'Failed to send reply');
 }
+
+// ────────────────────────────────────────────────────────────
+// Notifications & Read Tracking (Phase 3.4)
+// ────────────────────────────────────────────────────────────
+
+export async function fetchNotifications({ signal } = {}) {
+  const res = await fetch(`${API_BASE}/notifications`, {
+    method: 'GET',
+    credentials: 'include',
+    signal,
+  });
+  return readResponse(res, 'Failed to fetch notifications');
+}
+
+export async function markSessionAsRead(sessionId, messageId = null) {
+  const token = await csrfToken();
+  const payload = {};
+  if (messageId !== null && messageId !== undefined) {
+    payload.messageId = messageId;
+  }
+
+  const res = await fetch(`${API_BASE}/sessions/${encodeURIComponent(sessionId)}/read`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-CSRF-Token': token,
+    },
+    body: JSON.stringify(payload),
+  });
+  return readResponse(res, 'Failed to mark session as read');
+}
