@@ -4,6 +4,8 @@ import rateLimit from 'express-rate-limit';
 import { sanitizeDbErrorCode } from '../db.js';
 import { wrapAsyncHandler } from '../asyncHandler.js';
 import { sendPushNotificationForSession } from '../services/pushNotification.js';
+import { classifyAndStoreMessagePriority } from '../services/aiPriority.js';
+import { handleAutoReplyForSession } from '../services/autoReply.js';
 
 const TOKEN_REGEX = /^pkx_[0-9a-fA-F]{64}$/;
 const SESSION_ID_REGEX = /^vs_[0-9a-fA-F]{40,64}$/;
@@ -35,6 +37,86 @@ function compareHashes(hashA, hashB) {
   const bufB = Buffer.from(hashB, 'hex');
   if (bufA.length !== bufB.length) return false;
   return timingSafeEqual(bufA, bufB);
+}
+
+function handleVisitorMessageCreated({
+  pool,
+  messageId,
+  sessionDbId,
+  sessionId,
+  vehicleId,
+  body,
+  logger = console,
+}) {
+  (async () => {
+    try {
+      // 1. Asynchronously classify priority with AI and update visitor_messages / visitor_sessions
+      let priority = 'normal';
+      try {
+        const result = await classifyAndStoreMessagePriority({
+          pool,
+          messageId,
+          sessionDbId,
+          body,
+          logger,
+        });
+        priority = result.messagePriority || result.priority || 'normal';
+      } catch (classErr) {
+        if (logger?.error) {
+          logger.error('Failed to classify visitor message priority', {
+            error: classErr?.message,
+            messageId,
+          });
+        }
+      }
+
+      // 2. Safe automatic reply if owner is busy or away
+      if (sessionDbId) {
+        try {
+          await handleAutoReplyForSession({
+            pool,
+            sessionDbId,
+            sessionId,
+            vehicleId,
+            logger,
+          });
+        } catch (replyErr) {
+          if (logger?.error) {
+            logger.error('Failed to dispatch auto reply', {
+              error: replyErr?.message,
+              sessionDbId,
+            });
+          }
+        }
+      }
+
+      // 3. Dispatch push notification with priority metadata
+      if (vehicleId) {
+        try {
+          await sendPushNotificationForSession({
+            pool,
+            vehicleId,
+            sessionId,
+            priority,
+            logger,
+          });
+        } catch (pushErr) {
+          if (logger?.error) {
+            logger.error('Failed to dispatch push notification', {
+              error: pushErr?.message,
+              sessionId,
+            });
+          }
+        }
+      }
+    } catch (outerErr) {
+      if (logger?.error) {
+        logger.error('Error in post-message asynchronous handler', {
+          error: outerErr?.message,
+        });
+      }
+    }
+  })();
 }
 
 export function createPublicRouter({ pool, limiter, sessionCreateLimiter, sessionReadLimiter, messageCreateLimiter, logger, _testHook } = {}) {
@@ -136,9 +218,11 @@ export function createPublicRouter({ pool, limiter, sessionCreateLimiter, sessio
            q.status AS qr_status,
            v.vehicle_type,
            v.vehicle_model,
-           v.color
+           v.color,
+           COALESCE(u.availability_status, 'available') AS owner_availability
          FROM qr_codes q
          JOIN vehicles v ON v.id = q.vehicle_id
+         LEFT JOIN users u ON u.id = v.user_id
          WHERE q.token_hash = ?
          LIMIT 1`,
         [tokenHash]
@@ -167,6 +251,7 @@ export function createPublicRouter({ pool, limiter, sessionCreateLimiter, sessio
           vehicleModel: match.vehicle_model,
           color: match.color,
         },
+        ownerAvailability: match.owner_availability || 'available',
       });
     } catch (err) {
       const safeCode = sanitizeDbErrorCode(err?.code);
@@ -409,9 +494,11 @@ export function createPublicRouter({ pool, limiter, sessionCreateLimiter, sessio
            s.closed_at,
            v.vehicle_type,
            v.vehicle_model,
-           v.color
+           v.color,
+           COALESCE(u.availability_status, 'available') AS owner_availability
          FROM visitor_sessions s
          JOIN vehicles v ON v.id = s.vehicle_id
+         LEFT JOIN users u ON u.id = v.user_id
          WHERE s.public_id = ?
          LIMIT 1`,
         [sessionId]
@@ -461,6 +548,7 @@ export function createPublicRouter({ pool, limiter, sessionCreateLimiter, sessio
           vehicleModel: sessionRow.vehicle_model,
           color: sessionRow.color,
         },
+        ownerAvailability: sessionRow.owner_availability || 'available',
       });
     } catch (err) {
       const safeCode = sanitizeDbErrorCode(err?.code);
@@ -784,17 +872,15 @@ export function createPublicRouter({ pool, limiter, sessionCreateLimiter, sessio
 
           await connection.commit();
 
-          // Asynchronously dispatch push notification to vehicle owner (fire-and-forget, never fails response)
-          if (sessionRow.vehicle_id) {
-            sendPushNotificationForSession({
-              pool,
-              vehicleId: sessionRow.vehicle_id,
-              sessionId: sessionRow.public_id,
-              logger,
-            }).catch((pushErr) => {
-              if (logger?.error) logger.error('Failed to dispatch push notification', { error: pushErr?.message });
-            });
-          }
+          handleVisitorMessageCreated({
+            pool,
+            messageId: insertResult.insertId,
+            sessionDbId: sessionRow.id,
+            sessionId: sessionRow.public_id,
+            vehicleId: sessionRow.vehicle_id,
+            body: trimmedBody,
+            logger,
+          });
 
           return res.status(201).json({
             status: 'sent',
@@ -804,6 +890,9 @@ export function createPublicRouter({ pool, limiter, sessionCreateLimiter, sessio
               senderType: 'visitor',
               body: trimmedBody,
               clientMessageId,
+              priority: 'normal',
+              priorityReason: null,
+              isAutoReply: false,
               createdAt: now.toISOString(),
             },
           });
@@ -811,7 +900,8 @@ export function createPublicRouter({ pool, limiter, sessionCreateLimiter, sessio
           if (insertErr?.code === 'ER_DUP_ENTRY') {
             await connection.rollback();
             const [existingRows] = await pool.query(
-              `SELECT id, session_id, sender_type, body, client_message_id, created_at
+              `SELECT id, session_id, sender_type, body, client_message_id, created_at,
+                      priority, priority_reason, is_auto_reply
                FROM visitor_messages
                WHERE session_id = ? AND sender_type = 'visitor' AND client_message_id = ?
                LIMIT 1`,
@@ -827,6 +917,9 @@ export function createPublicRouter({ pool, limiter, sessionCreateLimiter, sessio
                   senderType: existing.sender_type,
                   body: existing.body,
                   clientMessageId: existing.client_message_id,
+                  priority: existing.priority || 'normal',
+                  priorityReason: existing.priority_reason || null,
+                  isAutoReply: Boolean(existing.is_auto_reply),
                   createdAt: existing.created_at instanceof Date ? existing.created_at.toISOString() : existing.created_at,
                 },
               });
@@ -845,17 +938,15 @@ export function createPublicRouter({ pool, limiter, sessionCreateLimiter, sessio
 
       await connection.commit();
 
-      // Asynchronously dispatch push notification to vehicle owner (fire-and-forget, never fails response)
-      if (sessionRow.vehicle_id) {
-        sendPushNotificationForSession({
-          pool,
-          vehicleId: sessionRow.vehicle_id,
-          sessionId: sessionRow.public_id,
-          logger,
-        }).catch((pushErr) => {
-          if (logger?.error) logger.error('Failed to dispatch push notification', { error: pushErr?.message });
-        });
-      }
+      handleVisitorMessageCreated({
+        pool,
+        messageId: insertResult.insertId,
+        sessionDbId: sessionRow.id,
+        sessionId: sessionRow.public_id,
+        vehicleId: sessionRow.vehicle_id,
+        body: trimmedBody,
+        logger,
+      });
 
       return res.status(201).json({
         status: 'sent',
@@ -865,6 +956,9 @@ export function createPublicRouter({ pool, limiter, sessionCreateLimiter, sessio
           senderType: 'visitor',
           body: trimmedBody,
           clientMessageId: null,
+          priority: 'normal',
+          priorityReason: null,
+          isAutoReply: false,
           createdAt: now.toISOString(),
         },
       });
@@ -960,7 +1054,8 @@ export function createPublicRouter({ pool, limiter, sessionCreateLimiter, sessio
       }
 
       const [msgRows] = await pool.query(
-        `SELECT id, sender_type, body, client_message_id, created_at
+        `SELECT id, sender_type, body, client_message_id, created_at,
+                priority, priority_reason, is_auto_reply
          FROM visitor_messages
          WHERE session_id = ? AND id > ?
          ORDER BY id ASC
@@ -977,6 +1072,9 @@ export function createPublicRouter({ pool, limiter, sessionCreateLimiter, sessio
         senderType: r.sender_type,
         body: r.body,
         clientMessageId: r.client_message_id || null,
+        priority: r.priority || 'normal',
+        priorityReason: r.priority_reason || null,
+        isAutoReply: Boolean(r.is_auto_reply),
         createdAt: r.created_at,
       }));
 

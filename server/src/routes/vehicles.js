@@ -3,6 +3,7 @@ import { Router } from 'express';
 import rateLimit from 'express-rate-limit';
 import { sanitizeDbErrorCode } from '../db.js';
 import { wrapAsyncHandler } from '../asyncHandler.js';
+import { DEFAULT_BUSY_MESSAGE, DEFAULT_AWAY_MESSAGE } from '../services/autoReply.js';
 
 const ALLOWED_VEHICLE_TYPES = new Set(['car', 'suv', 'ev', 'motorcycle', 'truck', 'van', 'other']);
 const MAX_REGISTRATION_RAW_LENGTH = 50;
@@ -132,6 +133,8 @@ function ownerSessionDTO(row) {
     expiresAt: row.expires_at,
     acceptedAt: row.accepted_at,
     closedAt: row.closed_at,
+    priority: row.session_priority || 'normal',
+    priorityOverridden: Boolean(row.priority_overridden),
     vehicle: {
       id: row.vehicle_id,
       registrationNumber: row.registration_number,
@@ -145,6 +148,8 @@ function ownerSessionDTO(row) {
     lastMessage: row.last_message_body ? {
       body: row.last_message_body,
       senderType: row.last_message_sender,
+      isAutoReply: Boolean(row.last_message_is_auto_reply),
+      priority: row.last_message_priority || 'normal',
       createdAt: row.last_message_created_at,
     } : null,
   };
@@ -322,13 +327,17 @@ export function createVehiclesRouter({ pool, origins, logger = console, ownerMes
       const userId = req.session.userId;
       const vehicleIdFilter = req.query.vehicleId ? Number(req.query.vehicleId) : null;
       const statusFilter = typeof req.query.status === 'string' ? req.query.status.trim() : null;
+      const priorityFilter = typeof req.query.priority === 'string' ? req.query.priority.trim().toLowerCase() : null;
 
       let query = `
         SELECT s.id, s.public_id, s.vehicle_id, s.status, s.created_at, s.expires_at, s.accepted_at, s.closed_at,
+               s.session_priority, s.priority_overridden,
                s.owner_last_read_message_id,
                v.registration_number, v.vehicle_type, v.vehicle_model, v.color,
                lm.body AS last_message_body,
                lm.sender_type AS last_message_sender,
+               lm.is_auto_reply AS last_message_is_auto_reply,
+               lm.priority AS last_message_priority,
                lm.created_at AS last_message_created_at,
                COALESCE(mc.msg_count, 0) AS message_count,
                COALESCE(uc.unread_count, 0) AS unread_count
@@ -348,7 +357,7 @@ export function createVehiclesRouter({ pool, origins, logger = console, ownerMes
           GROUP BY vm.session_id
         ) uc ON uc.session_id = s.id
         LEFT JOIN (
-          SELECT m1.session_id, m1.body, m1.sender_type, m1.created_at
+          SELECT m1.session_id, m1.body, m1.sender_type, m1.is_auto_reply, m1.priority, m1.created_at
           FROM visitor_messages m1
           JOIN (
             SELECT session_id, MAX(id) AS max_id
@@ -368,13 +377,185 @@ export function createVehiclesRouter({ pool, origins, logger = console, ownerMes
         query += ' AND s.status = ?';
         params.push(statusFilter);
       }
+      if (priorityFilter && ['urgent', 'high', 'normal', 'low'].includes(priorityFilter)) {
+        query += ' AND s.session_priority = ?';
+        params.push(priorityFilter);
+      }
 
-      query += ' ORDER BY s.created_at DESC LIMIT 100';
+      query += " ORDER BY FIELD(s.session_priority, 'urgent', 'high', 'normal', 'low'), COALESCE(lm.created_at, s.created_at) DESC LIMIT 100";
 
       const [rows] = await pool.query(query, params);
       return res.json({ sessions: rows.map(ownerSessionDTO) });
     } catch (error) {
       return sendError(res, error, logger);
+    }
+  }));
+
+  // ────────────────────────────────────────────────────────────
+  // GET /api/vehicles/availability — Retrieve owner availability & auto-reply config
+  // ────────────────────────────────────────────────────────────
+  router.get('/availability', wrapAsyncHandler(async (req, res) => {
+    try {
+      const userId = req.session.userId;
+      const [rows] = await pool.query(
+        `SELECT availability_status, auto_reply_enabled, auto_reply_busy, auto_reply_away, availability_updated_at
+         FROM users
+         WHERE id = ?
+         LIMIT 1`,
+        [userId]
+      );
+      if (!rows.length) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+      const user = rows[0];
+      return res.json({
+        status: user.availability_status || 'available',
+        autoReplyEnabled: Boolean(user.auto_reply_enabled),
+        autoReplyBusy: user.auto_reply_busy || DEFAULT_BUSY_MESSAGE,
+        autoReplyAway: user.auto_reply_away || DEFAULT_AWAY_MESSAGE,
+        updatedAt: user.availability_updated_at,
+      });
+    } catch (error) {
+      return sendError(res, error, logger);
+    }
+  }));
+
+  // ────────────────────────────────────────────────────────────
+  // PATCH /api/vehicles/availability — Update owner availability & auto-reply config
+  // ────────────────────────────────────────────────────────────
+  router.patch('/availability', csrf, wrapAsyncHandler(async (req, res) => {
+    const userId = req.session.userId;
+    const body = req.body || {};
+
+    const hasAnyField = body.status !== undefined || body.autoReplyEnabled !== undefined || body.autoReplyBusy !== undefined || body.autoReplyAway !== undefined;
+    if (!hasAnyField) {
+      return res.status(400).json({ message: 'No valid fields provided for update' });
+    }
+
+    let validatedStatus = null;
+    if (body.status !== undefined) {
+      if (typeof body.status !== 'string') {
+        return res.status(400).json({ message: 'Status must be a string' });
+      }
+      const rawStatus = body.status.toLowerCase().trim();
+      if (!['available', 'busy', 'away'].includes(rawStatus)) {
+        return res.status(400).json({ message: 'Status must be one of: available, busy, away' });
+      }
+      validatedStatus = rawStatus;
+    }
+
+    if (body.autoReplyEnabled !== undefined) {
+      if (typeof body.autoReplyEnabled !== 'boolean') {
+        return res.status(400).json({ message: 'autoReplyEnabled must be a boolean (true or false)' });
+      }
+    }
+
+    let sanitizedBusy = null;
+    if (body.autoReplyBusy !== undefined) {
+      if (typeof body.autoReplyBusy !== 'string') {
+        return res.status(400).json({ message: 'Busy auto-reply message must be a string' });
+      }
+      sanitizedBusy = sanitizeText(body.autoReplyBusy, 500);
+      if (!sanitizedBusy) {
+        return res.status(400).json({ message: 'Busy auto-reply message cannot be empty' });
+      }
+    }
+
+    let sanitizedAway = null;
+    if (body.autoReplyAway !== undefined) {
+      if (typeof body.autoReplyAway !== 'string') {
+        return res.status(400).json({ message: 'Away auto-reply message must be a string' });
+      }
+      sanitizedAway = sanitizeText(body.autoReplyAway, 500);
+      if (!sanitizedAway) {
+        return res.status(400).json({ message: 'Away auto-reply message cannot be empty' });
+      }
+    }
+
+    let connection;
+    try {
+      connection = typeof pool.getConnection === 'function' ? await pool.getConnection() : pool;
+      const canTransact = typeof connection.beginTransaction === 'function';
+      if (canTransact) await connection.beginTransaction();
+
+      // 1. Lock the user row to inspect current availability_status under row lock
+      const [userRows] = await connection.query(
+        `SELECT id, availability_status, availability_version
+         FROM users
+         WHERE id = ?
+         FOR UPDATE`,
+        [userId]
+      );
+
+      if (!userRows || userRows.length === 0) {
+        if (canTransact && typeof connection.rollback === 'function') await connection.rollback();
+        return res.status(404).json({ message: 'User not found' });
+      }
+
+      const currentUser = userRows[0];
+      const updates = [];
+      const params = [];
+
+      if (validatedStatus !== null) {
+        // Increment availability_version ONLY when the requested status actually differs from stored status
+        if (validatedStatus !== currentUser.availability_status) {
+          updates.push('availability_status = ?');
+          params.push(validatedStatus);
+          updates.push('availability_version = availability_version + 1');
+        }
+      }
+
+      if (body.autoReplyEnabled !== undefined) {
+        updates.push('auto_reply_enabled = ?');
+        params.push(body.autoReplyEnabled);
+      }
+
+      if (sanitizedBusy !== null) {
+        updates.push('auto_reply_busy = ?');
+        params.push(sanitizedBusy);
+      }
+
+      if (sanitizedAway !== null) {
+        updates.push('auto_reply_away = ?');
+        params.push(sanitizedAway);
+      }
+
+      // If changes occurred, execute update query
+      if (updates.length > 0) {
+        params.push(userId);
+        await connection.query(
+          `UPDATE users SET ${updates.join(', ')} WHERE id = ?`,
+          params
+        );
+      }
+
+      if (canTransact) await connection.commit();
+
+      const [rows] = await connection.query(
+        `SELECT availability_status, auto_reply_enabled, auto_reply_busy, auto_reply_away, availability_updated_at
+         FROM users
+         WHERE id = ?
+         LIMIT 1`,
+        [userId]
+      );
+
+      const updated = rows[0];
+      return res.json({
+        status: updated.availability_status || 'available',
+        autoReplyEnabled: Boolean(updated.auto_reply_enabled),
+        autoReplyBusy: updated.auto_reply_busy || DEFAULT_BUSY_MESSAGE,
+        autoReplyAway: updated.auto_reply_away || DEFAULT_AWAY_MESSAGE,
+        updatedAt: updated.availability_updated_at,
+      });
+    } catch (error) {
+      if (connection && typeof connection.rollback === 'function') {
+        try { await connection.rollback(); } catch {}
+      }
+      return sendError(res, error, logger);
+    } finally {
+      if (connection && typeof connection.release === 'function') {
+        connection.release();
+      }
     }
   }));
 
@@ -509,6 +690,91 @@ export function createVehiclesRouter({ pool, origins, logger = console, ownerMes
       });
     } catch (error) {
       return sendError(res, error, logger);
+    }
+  }));
+
+  // ────────────────────────────────────────────────────────────
+  // PATCH /api/vehicles/sessions/:sessionId/priority — Manual priority override
+  // ────────────────────────────────────────────────────────────
+  router.patch('/sessions/:sessionId/priority', csrf, wrapAsyncHandler(async (req, res) => {
+    let connection;
+    try {
+      const userId = req.session.userId;
+      const sessionId = req.params.sessionId;
+      if (!sessionId || !SESSION_ID_REGEX.test(sessionId)) {
+        return res.status(400).json({ message: 'Invalid session ID format' });
+      }
+
+      const priority = String(req.body?.priority || '').toLowerCase().trim();
+      if (!['urgent', 'high', 'normal', 'low'].includes(priority)) {
+        return res.status(400).json({ message: 'Priority must be one of: urgent, high, normal, low' });
+      }
+
+      connection = typeof pool.getConnection === 'function' ? await pool.getConnection() : pool;
+      const canTransact = typeof connection.beginTransaction === 'function';
+      if (canTransact) await connection.beginTransaction();
+
+      // Verify owner access to this session with FOR UPDATE
+      const [sessions] = await connection.query(
+        `SELECT s.id, s.public_id
+         FROM visitor_sessions s
+         JOIN vehicles v ON v.id = s.vehicle_id
+         WHERE s.public_id = ? AND v.user_id = ?
+         FOR UPDATE`,
+        [sessionId, userId]
+      );
+
+      if (!sessions || sessions.length === 0) {
+        if (canTransact && typeof connection.rollback === 'function') await connection.rollback();
+        return res.status(404).json({ message: 'Contact session not found' });
+      }
+
+      const sessionRow = sessions[0];
+
+      // If a specific messageId is given, override that message's priority as well
+      if (req.body?.messageId !== undefined && req.body?.messageId !== null) {
+        const messageId = Number(req.body.messageId);
+        if (!Number.isInteger(messageId) || messageId <= 0) {
+          if (canTransact && typeof connection.rollback === 'function') await connection.rollback();
+          return res.status(400).json({ message: 'Invalid message ID format' });
+        }
+        const [msgResult] = await connection.query(
+          `UPDATE visitor_messages
+           SET priority = ?, priority_reason = 'Manually overridden by owner', priority_overridden = TRUE
+           WHERE id = ? AND session_id = ?`,
+          [priority, messageId, sessionRow.id]
+        );
+        if (msgResult.affectedRows === 0) {
+          if (canTransact && typeof connection.rollback === 'function') await connection.rollback();
+          return res.status(404).json({ message: 'Message not found in this session' });
+        }
+      }
+
+      // Update session_priority and set priority_overridden = TRUE
+      await connection.query(
+        `UPDATE visitor_sessions
+         SET session_priority = ?, priority_overridden = TRUE
+         WHERE id = ?`,
+        [priority, sessionRow.id]
+      );
+
+      if (canTransact) await connection.commit();
+
+      return res.json({
+        status: 'ok',
+        sessionId,
+        priority,
+        priorityOverridden: true,
+      });
+    } catch (error) {
+      if (connection && typeof connection.rollback === 'function') {
+        try { await connection.rollback(); } catch {}
+      }
+      return sendError(res, error, logger);
+    } finally {
+      if (connection && typeof connection.release === 'function') {
+        connection.release();
+      }
     }
   }));
 
@@ -786,7 +1052,8 @@ export function createVehiclesRouter({ pool, origins, logger = console, ownerMes
       const session = rows[0];
 
       const [msgRows] = await pool.query(
-        `SELECT id, sender_type, body, client_message_id, created_at
+        `SELECT id, sender_type, body, client_message_id, created_at,
+                priority, priority_reason, priority_overridden, is_auto_reply
          FROM visitor_messages
          WHERE session_id = ? AND id > ?
          ORDER BY id ASC
@@ -803,6 +1070,9 @@ export function createVehiclesRouter({ pool, origins, logger = console, ownerMes
         senderType: r.sender_type,
         body: r.body,
         clientMessageId: r.client_message_id || null,
+        priority: r.priority || 'normal',
+        priorityReason: r.priority_reason || null,
+        isAutoReply: Boolean(r.is_auto_reply),
         createdAt: r.created_at,
       }));
 
@@ -1063,43 +1333,56 @@ export function createVehiclesRouter({ pool, origins, logger = console, ownerMes
         return res.status(404).json({ message: 'Vehicle not found' });
       }
 
-      const [rows] = await pool.query(
-        `SELECT s.id, s.public_id, s.vehicle_id, s.status, s.created_at, s.expires_at, s.accepted_at, s.closed_at,
-                s.owner_last_read_message_id,
-                v.registration_number, v.vehicle_type, v.vehicle_model, v.color,
-                lm.body AS last_message_body,
-                lm.sender_type AS last_message_sender,
-                lm.created_at AS last_message_created_at,
-                COALESCE(mc.msg_count, 0) AS message_count,
-                COALESCE(uc.unread_count, 0) AS unread_count
-         FROM visitor_sessions s
-         JOIN vehicles v ON v.id = s.vehicle_id
-         LEFT JOIN (
-           SELECT session_id, COUNT(*) AS msg_count
-           FROM visitor_messages
-           GROUP BY session_id
-         ) mc ON mc.session_id = s.id
-         LEFT JOIN (
-           SELECT vm.session_id, COUNT(*) AS unread_count
-           FROM visitor_messages vm
-           JOIN visitor_sessions vs ON vs.id = vm.session_id
-           WHERE vm.sender_type = 'visitor'
-             AND (vs.owner_last_read_message_id IS NULL OR vm.id > vs.owner_last_read_message_id)
-           GROUP BY vm.session_id
-         ) uc ON uc.session_id = s.id
-         LEFT JOIN (
-           SELECT m1.session_id, m1.body, m1.sender_type, m1.created_at
-           FROM visitor_messages m1
-           JOIN (
-             SELECT session_id, MAX(id) AS max_id
-             FROM visitor_messages
-             GROUP BY session_id
-           ) m2 ON m1.id = m2.max_id
-         ) lm ON lm.session_id = s.id
-         WHERE s.vehicle_id = ? AND v.user_id = ?
-         ORDER BY s.created_at DESC LIMIT 50`,
-        [vehicleId, userId]
-      );
+      const priorityFilter = typeof req.query.priority === 'string' ? req.query.priority.trim().toLowerCase() : null;
+
+      let query = `
+        SELECT s.id, s.public_id, s.vehicle_id, s.status, s.created_at, s.expires_at, s.accepted_at, s.closed_at,
+               s.session_priority, s.priority_overridden,
+               s.owner_last_read_message_id,
+               v.registration_number, v.vehicle_type, v.vehicle_model, v.color,
+               lm.body AS last_message_body,
+               lm.sender_type AS last_message_sender,
+               lm.is_auto_reply AS last_message_is_auto_reply,
+               lm.priority AS last_message_priority,
+               lm.created_at AS last_message_created_at,
+               COALESCE(mc.msg_count, 0) AS message_count,
+               COALESCE(uc.unread_count, 0) AS unread_count
+        FROM visitor_sessions s
+        JOIN vehicles v ON v.id = s.vehicle_id
+        LEFT JOIN (
+          SELECT session_id, COUNT(*) AS msg_count
+          FROM visitor_messages
+          GROUP BY session_id
+        ) mc ON mc.session_id = s.id
+        LEFT JOIN (
+          SELECT vm.session_id, COUNT(*) AS unread_count
+          FROM visitor_messages vm
+          JOIN visitor_sessions vs ON vs.id = vm.session_id
+          WHERE vm.sender_type = 'visitor'
+            AND (vs.owner_last_read_message_id IS NULL OR vm.id > vs.owner_last_read_message_id)
+          GROUP BY vm.session_id
+        ) uc ON uc.session_id = s.id
+        LEFT JOIN (
+          SELECT m1.session_id, m1.body, m1.sender_type, m1.is_auto_reply, m1.priority, m1.created_at
+          FROM visitor_messages m1
+          JOIN (
+            SELECT session_id, MAX(id) AS max_id
+            FROM visitor_messages
+            GROUP BY session_id
+          ) m2 ON m1.id = m2.max_id
+        ) lm ON lm.session_id = s.id
+        WHERE s.vehicle_id = ? AND v.user_id = ?
+      `;
+      const params = [vehicleId, userId];
+
+      if (priorityFilter && ['urgent', 'high', 'normal', 'low'].includes(priorityFilter)) {
+        query += ' AND s.session_priority = ?';
+        params.push(priorityFilter);
+      }
+
+      query += " ORDER BY FIELD(s.session_priority, 'urgent', 'high', 'normal', 'low'), COALESCE(lm.created_at, s.created_at) DESC LIMIT 50";
+
+      const [rows] = await pool.query(query, params);
 
       return res.json({ sessions: rows.map(ownerSessionDTO) });
     } catch (error) {

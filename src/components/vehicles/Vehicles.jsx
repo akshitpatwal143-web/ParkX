@@ -17,6 +17,10 @@ import {
   Bell,
   BellOff,
   BellRing,
+  AlertTriangle,
+  Settings2,
+  Check,
+  ChevronDown,
 } from 'lucide-react';
 import {
   fetchVehicles,
@@ -24,6 +28,9 @@ import {
   acceptVisitorSession,
   closeOwnerVisitorSession,
   markSessionAsRead,
+  fetchOwnerAvailability,
+  updateOwnerAvailability,
+  updateSessionPriority,
 } from '../../services/vehicleService';
 import {
   isPushSupported,
@@ -49,6 +56,22 @@ export default function Vehicles() {
   const [pushStatus, setPushStatus] = useState('loading'); // 'loading' | 'disabled' | 'enabled' | 'denied' | 'unsupported'
   const [pushLoading, setPushLoading] = useState(false);
   const [pushMessage, setPushMessage] = useState('');
+  const [priorityFilter, setPriorityFilter] = useState('all'); // 'all' | 'urgent' | 'high' | 'normal' | 'low'
+  const [availability, setAvailability] = useState({
+    status: 'available',
+    autoReplyEnabled: false,
+    autoReplyBusy: 'I am currently busy. I have received your message and will respond as soon as possible.',
+    autoReplyAway: 'I am currently away from my vehicle. I have received your message and will respond when I return.',
+  });
+  const [availabilityLoading, setAvailabilityLoading] = useState(false);
+  const [showAutoReplyModal, setShowAutoReplyModal] = useState(false);
+  const [tempAutoReply, setTempAutoReply] = useState({
+    status: 'available',
+    autoReplyEnabled: false,
+    autoReplyBusy: 'I am currently busy. I have received your message and will respond as soon as possible.',
+    autoReplyAway: 'I am currently away from my vehicle. I have received your message and will respond when I return.',
+  });
+  const [priorityUpdatingId, setPriorityUpdatingId] = useState(null);
 
   // View state: 'list' | 'add' | 'details'
   const [currentView, setCurrentView] = useState('list');
@@ -68,10 +91,70 @@ export default function Vehicles() {
     }
   };
 
-  const loadSessions = async () => {
+  const loadAvailability = async () => {
+    try {
+      const data = await fetchOwnerAvailability();
+      if (data) {
+        setAvailability(data);
+        setTempAutoReply(data);
+      }
+    } catch {}
+  };
+
+  const handleUpdateStatus = async (newStatus) => {
+    if (availability.status === newStatus || availabilityLoading) return;
+    setAvailabilityLoading(true);
+    try {
+      const updated = await updateOwnerAvailability({ status: newStatus });
+      setAvailability(updated);
+      setTempAutoReply(updated);
+    } catch (err) {
+      setError(err.message || 'Failed to update availability status');
+    } finally {
+      setAvailabilityLoading(false);
+    }
+  };
+
+  const handleSaveAutoReplySettings = async (e) => {
+    e?.preventDefault();
+    setAvailabilityLoading(true);
+    try {
+      const updated = await updateOwnerAvailability({
+        autoReplyEnabled: tempAutoReply.autoReplyEnabled,
+        autoReplyBusy: tempAutoReply.autoReplyBusy,
+        autoReplyAway: tempAutoReply.autoReplyAway,
+      });
+      setAvailability(updated);
+      setShowAutoReplyModal(false);
+    } catch (err) {
+      setError(err.message || 'Failed to save auto-reply settings');
+    } finally {
+      setAvailabilityLoading(false);
+    }
+  };
+
+  const handleOverridePriority = async (sessionId, newPriority) => {
+    setPriorityUpdatingId(sessionId);
+    try {
+      await updateSessionPriority(sessionId, newPriority);
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.sessionId === sessionId
+            ? { ...s, priority: newPriority, priorityOverridden: true }
+            : s
+        )
+      );
+    } catch (err) {
+      setError(err.message || 'Failed to update priority');
+    } finally {
+      setPriorityUpdatingId(null);
+    }
+  };
+
+  const loadSessions = async (filter = priorityFilter) => {
     setSessionsLoading(true);
     try {
-      const data = await fetchOwnerSessions();
+      const data = await fetchOwnerSessions({ priority: filter !== 'all' ? filter : undefined });
       setSessions(data.sessions || []);
     } catch {}
     finally {
@@ -81,8 +164,9 @@ export default function Vehicles() {
 
   useEffect(() => {
     loadVehicles();
-    loadSessions();
-  }, []);
+    loadSessions(priorityFilter);
+    loadAvailability();
+  }, [priorityFilter]);
 
   // Periodic polling for incoming sessions and unread message updates
   useEffect(() => {
@@ -292,6 +376,76 @@ export default function Vehicles() {
               >
                 <Plus className="w-4 h-4" />
                 <span>Register Vehicle</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Owner Availability & Auto-Reply Status Bar (Phase 3.5) */}
+          <div className="flex flex-wrap items-center justify-between gap-4 p-4 rounded-xl border border-white/[0.08] bg-[#121212] shadow-sm">
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="text-xs font-mono uppercase tracking-wider text-neutral-400">
+                My Status:
+              </span>
+              <div className="inline-flex rounded-lg border border-white/[0.08] p-1 bg-black/50">
+                <button
+                  type="button"
+                  onClick={() => handleUpdateStatus('available')}
+                  disabled={availabilityLoading}
+                  className={`inline-flex items-center space-x-1.5 px-3 py-1.5 rounded-md text-xs font-mono transition-colors ${
+                    availability.status === 'available'
+                      ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 font-semibold shadow-sm'
+                      : 'text-neutral-400 hover:text-white border border-transparent'
+                  }`}
+                >
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                  <span>Available</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleUpdateStatus('busy')}
+                  disabled={availabilityLoading}
+                  className={`inline-flex items-center space-x-1.5 px-3 py-1.5 rounded-md text-xs font-mono transition-colors ${
+                    availability.status === 'busy'
+                      ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30 font-semibold shadow-sm'
+                      : 'text-neutral-400 hover:text-white border border-transparent'
+                  }`}
+                >
+                  <span className="w-2 h-2 rounded-full bg-amber-400"></span>
+                  <span>Busy</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleUpdateStatus('away')}
+                  disabled={availabilityLoading}
+                  className={`inline-flex items-center space-x-1.5 px-3 py-1.5 rounded-md text-xs font-mono transition-colors ${
+                    availability.status === 'away'
+                      ? 'bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 font-semibold shadow-sm'
+                      : 'text-neutral-400 hover:text-white border border-transparent'
+                  }`}
+                >
+                  <span className="w-2 h-2 rounded-full bg-indigo-400"></span>
+                  <span>Away</span>
+                </button>
+              </div>
+            </div>
+
+            <div className="flex items-center space-x-3">
+              <button
+                type="button"
+                onClick={() => {
+                  setTempAutoReply({ ...availability });
+                  setShowAutoReplyModal(true);
+                }}
+                className={`inline-flex items-center space-x-1.5 px-3.5 py-2 rounded-lg border text-xs font-mono transition-colors ${
+                  availability.autoReplyEnabled
+                    ? 'bg-purple-500/15 text-purple-300 border-purple-500/30 font-semibold'
+                    : 'bg-white/[0.02] text-neutral-400 border-white/[0.08] hover:text-white hover:bg-white/[0.06]'
+                }`}
+              >
+                <Settings2 className="w-3.5 h-3.5 text-purple-400" />
+                <span>Auto-Reply: {availability.autoReplyEnabled ? 'ON' : 'OFF'}</span>
               </button>
             </div>
           </div>
@@ -535,6 +689,31 @@ export default function Vehicles() {
                 </button>
               </div>
 
+              {/* Priority Filter Bar (Phase 3.5) */}
+              <div className="flex flex-wrap items-center gap-2 pb-2">
+                <span className="text-[11px] font-mono text-neutral-400 mr-1 uppercase">Filter by Priority:</span>
+                {[
+                  { id: 'all', label: 'All' },
+                  { id: 'urgent', label: 'Urgent', color: 'text-red-400 border-red-500/40 bg-red-500/10' },
+                  { id: 'high', label: 'High', color: 'text-amber-400 border-amber-500/40 bg-amber-500/10' },
+                  { id: 'normal', label: 'Normal', color: 'text-sky-400 border-sky-500/40 bg-sky-500/10' },
+                  { id: 'low', label: 'Low', color: 'text-neutral-400 border-neutral-700 bg-neutral-800/40' },
+                ].map((f) => (
+                  <button
+                    key={f.id}
+                    type="button"
+                    onClick={() => setPriorityFilter(f.id)}
+                    className={`px-3 py-1 rounded-md text-xs font-mono uppercase tracking-wider transition-colors border ${
+                      priorityFilter === f.id
+                        ? f.color || 'bg-[#2ee6ca]/20 text-[#2ee6ca] border-[#2ee6ca]/50 font-bold'
+                        : 'border-white/[0.06] bg-white/[0.02] text-neutral-400 hover:text-white hover:bg-white/[0.05]'
+                    }`}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+
               {sessionsLoading && sessions.length === 0 ? (
                 <div className="py-20 flex flex-col items-center justify-center space-y-3">
                   <Loader2 className="w-8 h-8 text-[#2ee6ca] animate-spin" />
@@ -584,17 +763,35 @@ export default function Vehicles() {
                           )}
                         </div>
 
-                        <span
-                          className={`uppercase px-2 py-0.5 rounded text-[10px] font-semibold ${
-                            s.status === 'pending'
-                              ? 'bg-amber-400/10 text-amber-400 border border-amber-400/30'
-                              : s.status === 'accepted'
-                              ? 'bg-[#2ee6ca]/10 text-[#2ee6ca] border border-[#2ee6ca]/30'
-                              : 'bg-neutral-800 text-neutral-400'
-                          }`}
-                        >
-                          {s.status}
-                        </span>
+                        <div className="flex items-center space-x-1.5">
+                          {/* Priority Badge (Phase 3.5) */}
+                          <span
+                            className={`uppercase px-2 py-0.5 rounded text-[10px] font-semibold border ${
+                              s.priority === 'urgent'
+                                ? 'bg-red-500/20 text-red-400 border-red-500/40 shadow-sm'
+                                : s.priority === 'high'
+                                ? 'bg-amber-500/20 text-amber-400 border-amber-500/40'
+                                : s.priority === 'low'
+                                ? 'bg-neutral-800 text-neutral-400 border-neutral-700'
+                                : 'bg-sky-500/20 text-sky-400 border-sky-500/40'
+                            }`}
+                          >
+                            {s.priority || 'normal'}
+                            {s.priorityOverridden && ' *'}
+                          </span>
+
+                          <span
+                            className={`uppercase px-2 py-0.5 rounded text-[10px] font-semibold ${
+                              s.status === 'pending'
+                                ? 'bg-amber-400/10 text-amber-400 border border-amber-400/30'
+                                : s.status === 'accepted'
+                                ? 'bg-[#2ee6ca]/10 text-[#2ee6ca] border border-[#2ee6ca]/30'
+                                : 'bg-neutral-800 text-neutral-400'
+                            }`}
+                          >
+                            {s.status}
+                          </span>
+                        </div>
                       </div>
 
                       <div className="flex items-center justify-between text-[11px] text-neutral-400 border-t border-b border-white/[0.04] py-2">
@@ -605,9 +802,16 @@ export default function Vehicles() {
                       {s.lastMessage && (
                         <div className="bg-white/[0.02] border border-white/[0.04] rounded-lg p-2.5 space-y-1">
                           <div className="flex items-center justify-between text-[10px] text-neutral-400">
-                            <span className="font-semibold text-neutral-300">
-                              {s.lastMessage.senderType === 'owner' ? 'You' : 'Visitor'}:
-                            </span>
+                            <div className="flex items-center space-x-1.5">
+                              <span className="font-semibold text-neutral-300">
+                                {s.lastMessage.senderType === 'owner' ? 'You' : 'Visitor'}:
+                              </span>
+                              {s.lastMessage.isAutoReply && (
+                                <span className="px-1.5 py-0.5 rounded text-[9px] bg-purple-500/20 text-purple-300 border border-purple-500/30">
+                                  Auto-reply
+                                </span>
+                              )}
+                            </div>
                             <span>{new Date(s.lastMessage.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                           </div>
                           <p className="text-neutral-300 truncate text-[11px]">
@@ -615,6 +819,28 @@ export default function Vehicles() {
                           </p>
                         </div>
                       )}
+
+                      {/* Manual Priority Override Bar (Phase 3.5) */}
+                      <div className="flex items-center justify-between text-[11px] text-neutral-400 pt-0.5">
+                        <span className="text-[10px] uppercase text-neutral-500">Override Priority:</span>
+                        <div className="flex items-center space-x-1">
+                          {['urgent', 'high', 'normal', 'low'].map((p) => (
+                            <button
+                              key={p}
+                              type="button"
+                              disabled={priorityUpdatingId === s.sessionId || s.priority === p}
+                              onClick={() => handleOverridePriority(s.sessionId, p)}
+                              className={`px-1.5 py-0.5 rounded text-[10px] uppercase font-mono transition-colors ${
+                                s.priority === p
+                                  ? 'bg-white/20 text-white font-bold'
+                                  : 'text-neutral-500 hover:text-neutral-300 hover:bg-white/[0.05]'
+                              }`}
+                            >
+                              {p}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
 
                       <div className="flex items-center space-x-2 pt-1">
                         <button
@@ -693,6 +919,142 @@ export default function Vehicles() {
             setActiveConversationSession((prev) => (prev ? { ...prev, ...updated } : prev));
           }}
         />
+      )}
+
+      {/* Auto-Reply Settings Modal (Phase 3.5) */}
+      {showAutoReplyModal && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Auto-Reply Settings"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:p-6 bg-black/80 backdrop-blur-md animate-fadeIn"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setShowAutoReplyModal(false);
+          }}
+        >
+          <div className="relative w-full max-w-lg bg-[#0c0c0c] border border-white/[0.1] rounded-2xl shadow-2xl overflow-hidden">
+            <div className="p-5 border-b border-white/[0.08] flex items-center justify-between bg-white/[0.02]">
+              <div className="flex items-center space-x-3">
+                <div className="w-9 h-9 rounded-xl border border-purple-500/30 bg-purple-500/10 flex items-center justify-center text-purple-300">
+                  <Settings2 className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-mono text-sm font-bold text-white uppercase tracking-wider">
+                    Automatic Reply Settings
+                  </h3>
+                  <p className="text-[11px] text-neutral-400">
+                    Safe automated responses when you are Busy or Away
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowAutoReplyModal(false)}
+                className="p-1.5 rounded-lg border border-white/[0.06] text-neutral-400 hover:text-white hover:bg-white/[0.06] transition-colors"
+              >
+                <XCircle className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveAutoReplySettings} className="p-5 space-y-4 font-mono">
+              {/* Enable / Disable Toggle */}
+              <div className="flex items-center justify-between p-3 rounded-xl border border-white/[0.08] bg-white/[0.02]">
+                <div>
+                  <span className="text-xs font-semibold text-white block">Enable Auto-Reply</span>
+                  <span className="text-[11px] text-neutral-400 block">
+                    Automatically reply to new visitor messages when Busy or Away
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setTempAutoReply((prev) => ({
+                      ...prev,
+                      autoReplyEnabled: !prev.autoReplyEnabled,
+                    }))
+                  }
+                  className={`w-12 h-6 rounded-full transition-colors relative p-0.5 ${
+                    tempAutoReply.autoReplyEnabled ? 'bg-[#2ee6ca]' : 'bg-neutral-800'
+                  }`}
+                >
+                  <span
+                    className={`block w-5 h-5 rounded-full bg-black transform transition-transform ${
+                      tempAutoReply.autoReplyEnabled ? 'translate-x-6' : 'translate-x-0'
+                    }`}
+                  />
+                </button>
+              </div>
+
+              {/* Busy Message */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-neutral-300 flex items-center justify-between">
+                  <span>When Busy:</span>
+                  <span className="text-[10px] text-neutral-500">
+                    {(tempAutoReply.autoReplyBusy || '').length} / 500
+                  </span>
+                </label>
+                <textarea
+                  rows={3}
+                  maxLength={500}
+                  value={tempAutoReply.autoReplyBusy || ''}
+                  onChange={(e) =>
+                    setTempAutoReply((prev) => ({
+                      ...prev,
+                      autoReplyBusy: e.target.value,
+                    }))
+                  }
+                  placeholder="Enter auto-reply text when Busy..."
+                  className="w-full bg-black/60 border border-white/[0.1] focus:border-[#2ee6ca]/60 focus:outline-none rounded-xl p-3 text-xs text-white placeholder-neutral-500 transition-colors"
+                />
+              </div>
+
+              {/* Away Message */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-neutral-300 flex items-center justify-between">
+                  <span>When Away:</span>
+                  <span className="text-[10px] text-neutral-500">
+                    {(tempAutoReply.autoReplyAway || '').length} / 500
+                  </span>
+                </label>
+                <textarea
+                  rows={3}
+                  maxLength={500}
+                  value={tempAutoReply.autoReplyAway || ''}
+                  onChange={(e) =>
+                    setTempAutoReply((prev) => ({
+                      ...prev,
+                      autoReplyAway: e.target.value,
+                    }))
+                  }
+                  placeholder="Enter auto-reply text when Away..."
+                  className="w-full bg-black/60 border border-white/[0.1] focus:border-[#2ee6ca]/60 focus:outline-none rounded-xl p-3 text-xs text-white placeholder-neutral-500 transition-colors"
+                />
+              </div>
+
+              <div className="p-2.5 rounded-lg border border-white/[0.04] bg-white/[0.015] text-[10px] text-neutral-400">
+                🛡️ Anti-spam protection: Visitors receive at most 1 automated reply per session during a single status period.
+              </div>
+
+              <div className="flex items-center justify-end space-x-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowAutoReplyModal(false)}
+                  className="px-3 py-2 rounded-xl border border-white/[0.1] text-neutral-300 text-xs hover:bg-white/[0.05] transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={availabilityLoading}
+                  className="px-4 py-2 rounded-xl bg-[#2ee6ca] hover:bg-[#28d1b7] text-black text-xs font-semibold uppercase tracking-wider transition-colors disabled:opacity-50 flex items-center space-x-1.5"
+                >
+                  {availabilityLoading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                  <span>Save Settings</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
       )}
     </div>
   );

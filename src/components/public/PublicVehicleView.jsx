@@ -70,6 +70,7 @@ export default function PublicVehicleView({ token, onNavigateHome }) {
     ? (!token || typeof token !== 'string' ? 'invalid' : 'loading')
     : verificationState.status;
   const effectiveVehicle = isTokenStale ? null : verificationState.vehicle;
+  const effectiveOwnerAvailability = isTokenStale ? 'available' : (verificationState.ownerAvailability || 'available');
   const effectiveStatusMessage = isTokenStale
     ? (!token || typeof token !== 'string' ? 'No QR pass token provided in the URL.' : '')
     : verificationState.message;
@@ -170,6 +171,7 @@ export default function PublicVehicleView({ token, onNavigateHome }) {
             token: currentToken,
             status: 'valid',
             vehicle: result.vehicle,
+            ownerAvailability: result.ownerAvailability || 'available',
             message: '',
           });
         } else if (result.status === 'revoked') {
@@ -563,10 +565,40 @@ export default function PublicVehicleView({ token, onNavigateHome }) {
 
           {/* Minimal Vehicle Identity (Never reveals owner, phone, or plate) */}
           <div className="p-6 rounded-xl bg-[#141414] border border-white/[0.06] space-y-4">
-            <span className="text-[10px] font-mono tracking-widest uppercase text-neutral-400 flex items-center space-x-2">
-              <Sparkles className="w-3.5 h-3.5 text-[#2ee6ca]" />
-              <span>Target Vehicle Specifications</span>
-            </span>
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] font-mono tracking-widest uppercase text-neutral-400 flex items-center space-x-2">
+                <Sparkles className="w-3.5 h-3.5 text-[#2ee6ca]" />
+                <span>Target Vehicle Specifications</span>
+              </span>
+
+              {/* Owner Availability Badge (Phase 3.5) */}
+              <span
+                className={`inline-flex items-center space-x-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-mono uppercase font-semibold border ${
+                  effectiveOwnerAvailability === 'busy'
+                    ? 'bg-amber-500/10 text-amber-400 border-amber-500/30'
+                    : effectiveOwnerAvailability === 'away'
+                    ? 'bg-indigo-500/10 text-indigo-400 border-indigo-500/30'
+                    : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                }`}
+              >
+                <span
+                  className={`w-1.5 h-1.5 rounded-full ${
+                    effectiveOwnerAvailability === 'busy'
+                      ? 'bg-amber-400'
+                      : effectiveOwnerAvailability === 'away'
+                      ? 'bg-indigo-400'
+                      : 'bg-emerald-400 animate-pulse'
+                  }`}
+                />
+                <span>
+                  Owner {effectiveOwnerAvailability === 'busy'
+                    ? 'Busy'
+                    : effectiveOwnerAvailability === 'away'
+                    ? 'Away'
+                    : 'Available'}
+                </span>
+              </span>
+            </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-2">
               {/* Model */}
@@ -710,6 +742,11 @@ export default function PublicVehicleView({ token, onNavigateHome }) {
                             <span className="font-semibold text-neutral-300">
                               {isVisitor ? 'You' : 'Vehicle Owner'}
                             </span>
+                            {!isVisitor && m.isAutoReply && (
+                              <span className="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-purple-500/20 text-purple-300 border border-purple-500/30">
+                                Automated
+                              </span>
+                            )}
                             <span>•</span>
                             <span>{new Date(m.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                           </div>
@@ -761,6 +798,10 @@ export default function PublicVehicleView({ token, onNavigateHome }) {
                       <span>{messageText.length} / 2000</span>
                       <span>Press Enter to send message</span>
                     </div>
+
+                    <p className="text-[10px] font-mono text-neutral-500 pt-1 border-t border-white/[0.04]">
+                      Notice: Message content may be processed by Google AI for priority classification to alert the vehicle owner appropriately.
+                    </p>
                   </form>
                 ) : (
                   <div className="p-2.5 text-center rounded-lg border border-white/[0.06] bg-black/30 text-neutral-400 text-xs font-mono">
@@ -789,7 +830,7 @@ export default function PublicVehicleView({ token, onNavigateHome }) {
             )}
 
             <p className="text-center text-[11px] font-mono text-neutral-500">
-              No account, login, or personal phone number required. The owner never sees your identity.
+              No account, login, or personal phone number required. The owner never sees your identity. Message urgency may be classified by Google AI.
             </p>
           </div>
         </div>

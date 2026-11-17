@@ -81,10 +81,11 @@ export async function rotateQrCode(id) {
   return readResponse(res, 'Failed to rotate QR code');
 }
 
-export async function fetchOwnerSessions({ vehicleId, status } = {}) {
+export async function fetchOwnerSessions({ vehicleId, status, priority } = {}) {
   const params = new URLSearchParams();
   if (vehicleId) params.set('vehicleId', vehicleId);
   if (status) params.set('status', status);
+  if (priority && priority !== 'all') params.set('priority', priority);
   const qs = params.toString() ? `?${params.toString()}` : '';
 
   const res = await fetch(`${API_BASE}/sessions${qs}`, {
@@ -192,4 +193,52 @@ export async function markSessionAsRead(sessionId, messageId = null) {
     body: JSON.stringify(payload),
   });
   return readResponse(res, 'Failed to mark session as read');
+}
+
+// ────────────────────────────────────────────────────────────
+// Owner Availability & Priority (Phase 3.5)
+// ────────────────────────────────────────────────────────────
+
+export async function fetchOwnerAvailability({ signal } = {}) {
+  const res = await fetch(`${API_BASE}/availability`, {
+    method: 'GET',
+    credentials: 'include',
+    signal,
+  });
+  return readResponse(res, 'Failed to fetch availability status');
+}
+
+export async function updateOwnerAvailability(updates, { signal } = {}) {
+  const token = await csrfToken();
+  const res = await fetch(`${API_BASE}/availability`, {
+    method: 'PATCH',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-CSRF-Token': token,
+    },
+    body: JSON.stringify(updates),
+    signal,
+  });
+  return readResponse(res, 'Failed to update availability status');
+}
+
+export async function updateSessionPriority(sessionId, priority, messageId = null, { signal } = {}) {
+  const token = await csrfToken();
+  const payload = { priority };
+  if (messageId !== null && messageId !== undefined) {
+    payload.messageId = messageId;
+  }
+
+  const res = await fetch(`${API_BASE}/sessions/${encodeURIComponent(sessionId)}/priority`, {
+    method: 'PATCH',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-CSRF-Token': token,
+    },
+    body: JSON.stringify(payload),
+    signal,
+  });
+  return readResponse(res, 'Failed to update priority');
 }
