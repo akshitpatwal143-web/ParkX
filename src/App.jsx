@@ -4,6 +4,7 @@ import Navbar from './components/Navbar';
 import AuthModal from './components/auth/AuthModal';
 import FrameCanvas from './components/FrameCanvas';
 import Hero from './components/Hero';
+import AboutParkX from './components/AboutParkX';
 import Footer from './components/Footer';
 import Vehicles from './components/vehicles/Vehicles';
 import PublicVehicleView from './components/public/PublicVehicleView';
@@ -215,12 +216,19 @@ function MainLayout() {
             {/* ONLY OVERLAY: HERO SECTION (THE FUTURE OF PARKING) */}
             <div className="relative min-h-screen flex flex-col justify-center">
               <Hero onExploreClick={() => {
-                window.scrollBy({ top: window.innerHeight * 0.9, behavior: 'smooth' });
+                const aboutEl = document.getElementById('about');
+                if (aboutEl) {
+                  aboutEl.scrollIntoView({ behavior: 'smooth' });
+                } else {
+                  window.scrollBy({ top: window.innerHeight * 0.9, behavior: 'smooth' });
+                }
               }} />
             </div>
 
-            {/* After Hero: ZERO OVERLAYS TILL LAST FRAME OF CAR.
-                The remaining ~320vh is 100% unobstructed, pure cinematic car movement. */}
+            {/* ABOUT PARKX SECTION — Reveals smoothly as the car descends */}
+            <div className="relative min-h-screen flex flex-col justify-center mt-[30vh] sm:mt-[45vh] mb-20 sm:mb-32">
+              <AboutParkX onGetStarted={() => handleNavigateView('garage')} />
+            </div>
           </div>
 
           {/* FOOTER AT LAST FRAME OF CAR */}

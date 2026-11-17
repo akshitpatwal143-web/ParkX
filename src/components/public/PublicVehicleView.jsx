@@ -800,7 +800,7 @@ export default function PublicVehicleView({ token, onNavigateHome }) {
                     </div>
 
                     <p className="text-[10px] font-mono text-neutral-500 pt-1 border-t border-white/[0.04]">
-                      Notice: Message content may be processed by Google AI for priority classification to alert the vehicle owner appropriately.
+                      AI may process messages to prioritize alerts.
                     </p>
                   </form>
                 ) : (
@@ -830,7 +830,7 @@ export default function PublicVehicleView({ token, onNavigateHome }) {
             )}
 
             <p className="text-center text-[11px] font-mono text-neutral-500">
-              No account, login, or personal phone number required. The owner never sees your identity. Message urgency may be classified by Google AI.
+              No account, login, or personal phone number required. The owner never sees your identity.
             </p>
           </div>
         </div>
