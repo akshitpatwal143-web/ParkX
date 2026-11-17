@@ -49,6 +49,7 @@ export async function applyMigrations(pool, migrationDirectory = directory) {
         if (file === '007_visitor_sessions.sql') await verifyVisitorSessionsSchema(connection);
         if (file === '008_visitor_messages.sql') await verifyVisitorMessagesSchema(connection);
         if (file === '009_owner_notifications.sql') await verifyOwnerNotificationsSchema(connection);
+        if (file === '010_ai_priority_and_availability.sql') await verifyAiPriorityAndAvailabilitySchema(connection);
         continue;
       }
       if (file.startsWith('003_')) await assertNoNormalizedEmailDuplicates(connection);
@@ -100,6 +101,68 @@ export async function applyMigrations(pool, migrationDirectory = directory) {
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
         }
         await verifyOwnerNotificationsSchema(connection);
+      } else if (file === '010_ai_priority_and_availability.sql') {
+        // Users table columns
+        if (!(await columnExists(connection, 'users', 'availability_status'))) {
+          await connection.query("ALTER TABLE users ADD COLUMN availability_status ENUM('available', 'busy', 'away') NOT NULL DEFAULT 'available'");
+        }
+        if (!(await columnExists(connection, 'users', 'auto_reply_enabled'))) {
+          await connection.query('ALTER TABLE users ADD COLUMN auto_reply_enabled BOOLEAN NOT NULL DEFAULT FALSE');
+        }
+        if (!(await columnExists(connection, 'users', 'auto_reply_busy'))) {
+          await connection.query("ALTER TABLE users ADD COLUMN auto_reply_busy VARCHAR(500) NULL DEFAULT 'I am currently busy. I have received your message and will respond as soon as possible.'");
+        } else {
+          // Ensure VARCHAR(500) for auto_reply_busy
+          await connection.query("ALTER TABLE users MODIFY COLUMN auto_reply_busy VARCHAR(500) NULL DEFAULT 'I am currently busy. I have received your message and will respond as soon as possible.'");
+        }
+        if (!(await columnExists(connection, 'users', 'auto_reply_away'))) {
+          await connection.query("ALTER TABLE users ADD COLUMN auto_reply_away VARCHAR(500) NULL DEFAULT 'I am currently away from my vehicle. I have received your message and will respond when I return.'");
+        } else {
+          // Ensure VARCHAR(500) for auto_reply_away
+          await connection.query("ALTER TABLE users MODIFY COLUMN auto_reply_away VARCHAR(500) NULL DEFAULT 'I am currently away from my vehicle. I have received your message and will respond when I return.'");
+        }
+        if (!(await columnExists(connection, 'users', 'availability_version'))) {
+          await connection.query('ALTER TABLE users ADD COLUMN availability_version INT UNSIGNED NOT NULL DEFAULT 1');
+        }
+        if (!(await columnExists(connection, 'users', 'availability_updated_at'))) {
+          await connection.query('ALTER TABLE users ADD COLUMN availability_updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP');
+        }
+
+        // Visitor messages table columns & index
+        if (!(await columnExists(connection, 'visitor_messages', 'priority'))) {
+          await connection.query("ALTER TABLE visitor_messages ADD COLUMN priority ENUM('urgent', 'high', 'normal', 'low') NOT NULL DEFAULT 'normal'");
+        }
+        if (!(await columnExists(connection, 'visitor_messages', 'priority_reason'))) {
+          await connection.query('ALTER TABLE visitor_messages ADD COLUMN priority_reason VARCHAR(255) NULL DEFAULT NULL');
+        }
+        if (!(await columnExists(connection, 'visitor_messages', 'priority_overridden'))) {
+          await connection.query('ALTER TABLE visitor_messages ADD COLUMN priority_overridden BOOLEAN NOT NULL DEFAULT FALSE');
+        }
+        if (!(await columnExists(connection, 'visitor_messages', 'is_auto_reply'))) {
+          await connection.query('ALTER TABLE visitor_messages ADD COLUMN is_auto_reply BOOLEAN NOT NULL DEFAULT FALSE');
+        }
+        if (!(await indexExists(connection, 'visitor_messages', 'idx_visitor_messages_priority'))) {
+          await connection.query('ALTER TABLE visitor_messages ADD KEY idx_visitor_messages_priority (session_id, priority)');
+        }
+
+        // Visitor sessions table columns & index
+        if (!(await columnExists(connection, 'visitor_sessions', 'session_priority'))) {
+          await connection.query("ALTER TABLE visitor_sessions ADD COLUMN session_priority ENUM('urgent', 'high', 'normal', 'low') NOT NULL DEFAULT 'normal'");
+        }
+        if (!(await columnExists(connection, 'visitor_sessions', 'priority_overridden'))) {
+          await connection.query('ALTER TABLE visitor_sessions ADD COLUMN priority_overridden BOOLEAN NOT NULL DEFAULT FALSE');
+        }
+        if (!(await columnExists(connection, 'visitor_sessions', 'last_auto_reply_status'))) {
+          await connection.query("ALTER TABLE visitor_sessions ADD COLUMN last_auto_reply_status ENUM('available', 'busy', 'away') NULL DEFAULT NULL");
+        }
+        if (!(await columnExists(connection, 'visitor_sessions', 'last_auto_reply_version'))) {
+          await connection.query('ALTER TABLE visitor_sessions ADD COLUMN last_auto_reply_version INT UNSIGNED NULL DEFAULT NULL');
+        }
+        if (!(await indexExists(connection, 'visitor_sessions', 'idx_visitor_sessions_priority'))) {
+          await connection.query('ALTER TABLE visitor_sessions ADD KEY idx_visitor_sessions_priority (session_priority, created_at)');
+        }
+
+        await verifyAiPriorityAndAvailabilitySchema(connection);
       } else {
         const sql = (await readFile(path.join(migrationDirectory, file), 'utf8')).replace(/^\s*--.*$/gm, '');
         for (const statement of sql.split(';').map((part) => part.trim()).filter(Boolean)) {
@@ -140,6 +203,14 @@ async function columnExists(connection, table, column) {
   const [rows] = await connection.query(
     'SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ? LIMIT 1',
     [table, column]
+  );
+  return rows.length > 0;
+}
+
+async function indexExists(connection, table, indexName) {
+  const [rows] = await connection.query(
+    'SELECT 1 FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ? LIMIT 1',
+    [table, indexName]
   );
   return rows.length > 0;
 }
@@ -483,7 +554,8 @@ export async function verifyVisitorSessionsSchema(connection) {
 
   if (cols.length !== 9) {
     const hasReadCursor = cols.some((c) => c.COLUMN_NAME === 'owner_last_read_message_id');
-    if (!(cols.length === 10 && hasReadCursor)) {
+    const hasPriority = cols.some((c) => c.COLUMN_NAME === 'session_priority');
+    if (!(cols.length === 10 && hasReadCursor) && !(cols.length === 14 && hasReadCursor && hasPriority) && !(cols.length === 13 && hasReadCursor && hasPriority)) {
       throw migration007Error(`visitor_sessions table must contain exactly 9 columns, found ${cols.length}.`);
     }
   }
@@ -738,6 +810,13 @@ export async function verifyVisitorSessionsSchema(connection) {
     ],
   ]);
 
+  if (indexGroups.has('idx_visitor_sessions_priority')) {
+    expectedIndexes.set('idx_visitor_sessions_priority', {
+      unique: false,
+      columns: ['session_priority', 'created_at'],
+    });
+  }
+
   // Reject unexpected extra indexes
   for (const actualName of indexGroups.keys()) {
     if (!expectedIndexes.has(actualName)) {
@@ -861,7 +940,10 @@ export async function verifyVisitorMessagesSchema(connection) {
   );
 
   if (cols.length !== 6) {
-    throw migration008Error(`visitor_messages table must contain exactly 6 columns, found ${cols.length}.`);
+    const hasPriority = cols.some((c) => c.COLUMN_NAME === 'priority');
+    if (!(cols.length === 10 && hasPriority)) {
+      throw migration008Error(`visitor_messages table must contain exactly 6 columns, found ${cols.length}.`);
+    }
   }
 
   for (const c of cols) {
@@ -1037,6 +1119,13 @@ export async function verifyVisitorMessagesSchema(connection) {
       },
     ],
   ]);
+
+  if (indexGroups.has('idx_visitor_messages_priority')) {
+    expectedIndexes.set('idx_visitor_messages_priority', {
+      unique: false,
+      columns: ['session_id', 'priority'],
+    });
+  }
 
   for (const actualName of indexGroups.keys()) {
     if (!expectedIndexes.has(actualName)) {
@@ -1359,6 +1448,225 @@ export async function verifyOwnerNotificationsSchema(connection) {
     !['NO ACTION', 'RESTRICT'].includes(validFk[0].UPDATE_RULE)
   ) {
     throw migration009Error('foreign key must be named fk_push_subscriptions_user_id and reference user_id to users(id) with ON DELETE CASCADE.');
+  }
+}
+
+export function migration010Error(message) {
+  return new Error(`Migration 010 schema inconsistency: ${message}`);
+}
+
+export async function verifyAiPriorityAndAvailabilitySchema(connection) {
+  // 1. Verify users table columns
+  const [userCols] = await connection.query(
+    `SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, GENERATION_EXPRESSION
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users'
+       AND COLUMN_NAME IN ('availability_status', 'auto_reply_enabled', 'auto_reply_busy', 'auto_reply_away', 'availability_version', 'availability_updated_at')`
+  );
+  const userColMap = new Map(userCols.map((c) => [c.COLUMN_NAME, c]));
+
+  const availStatusCol = userColMap.get('availability_status');
+  if (
+    !availStatusCol ||
+    !availStatusCol.COLUMN_TYPE.toLowerCase().includes("enum('available','busy','away')") ||
+    availStatusCol.IS_NULLABLE !== 'NO' ||
+    availStatusCol.COLUMN_DEFAULT !== 'available'
+  ) {
+    throw migration010Error("users.availability_status must be ENUM('available','busy','away') NOT NULL DEFAULT 'available'.");
+  }
+
+  const autoReplyCol = userColMap.get('auto_reply_enabled');
+  if (
+    !autoReplyCol ||
+    (autoReplyCol.COLUMN_TYPE.toLowerCase() !== 'tinyint(1)' && autoReplyCol.COLUMN_TYPE.toLowerCase() !== 'boolean') ||
+    autoReplyCol.IS_NULLABLE !== 'NO' ||
+    (autoReplyCol.COLUMN_DEFAULT !== '0' && autoReplyCol.COLUMN_DEFAULT !== 'b\'0\'')
+  ) {
+    throw migration010Error('users.auto_reply_enabled must be BOOLEAN NOT NULL DEFAULT FALSE.');
+  }
+
+  const expectedBusyDefault = 'I am currently busy. I have received your message and will respond as soon as possible.';
+  const expectedAwayDefault = 'I am currently away from my vehicle. I have received your message and will respond when I return.';
+
+  const autoReplyBusyCol = userColMap.get('auto_reply_busy');
+  if (
+    !autoReplyBusyCol ||
+    autoReplyBusyCol.COLUMN_TYPE.toLowerCase() !== 'varchar(500)' ||
+    autoReplyBusyCol.IS_NULLABLE !== 'YES' ||
+    autoReplyBusyCol.COLUMN_DEFAULT !== expectedBusyDefault
+  ) {
+    throw migration010Error(`users.auto_reply_busy must be VARCHAR(500) NULL DEFAULT '${expectedBusyDefault}'.`);
+  }
+
+  const autoReplyAwayCol = userColMap.get('auto_reply_away');
+  if (
+    !autoReplyAwayCol ||
+    autoReplyAwayCol.COLUMN_TYPE.toLowerCase() !== 'varchar(500)' ||
+    autoReplyAwayCol.IS_NULLABLE !== 'YES' ||
+    autoReplyAwayCol.COLUMN_DEFAULT !== expectedAwayDefault
+  ) {
+    throw migration010Error(`users.auto_reply_away must be VARCHAR(500) NULL DEFAULT '${expectedAwayDefault}'.`);
+  }
+
+  const availVersionCol = userColMap.get('availability_version');
+  if (
+    !availVersionCol ||
+    availVersionCol.COLUMN_TYPE.toLowerCase() !== 'int unsigned' ||
+    availVersionCol.IS_NULLABLE !== 'NO' ||
+    availVersionCol.COLUMN_DEFAULT !== '1'
+  ) {
+    throw migration010Error('users.availability_version must be INT UNSIGNED NOT NULL DEFAULT 1.');
+  }
+
+  const availUpdatedCol = userColMap.get('availability_updated_at');
+  if (
+    !availUpdatedCol ||
+    availUpdatedCol.COLUMN_TYPE.toLowerCase() !== 'timestamp' ||
+    availUpdatedCol.IS_NULLABLE !== 'NO' ||
+    !String(availUpdatedCol.COLUMN_DEFAULT || '').toUpperCase().includes('CURRENT_TIMESTAMP') ||
+    !String(availUpdatedCol.EXTRA || '').toLowerCase().includes('on update current_timestamp')
+  ) {
+    throw migration010Error('users.availability_updated_at must be TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP.');
+  }
+
+  // 2. Verify visitor_messages table columns
+  const [msgCols] = await connection.query(
+    `SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, GENERATION_EXPRESSION
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'visitor_messages'
+       AND COLUMN_NAME IN ('priority', 'priority_reason', 'priority_overridden', 'is_auto_reply')`
+  );
+  const msgColMap = new Map(msgCols.map((c) => [c.COLUMN_NAME, c]));
+
+  const priorityCol = msgColMap.get('priority');
+  if (
+    !priorityCol ||
+    !priorityCol.COLUMN_TYPE.toLowerCase().includes("enum('urgent','high','normal','low')") ||
+    priorityCol.IS_NULLABLE !== 'NO' ||
+    priorityCol.COLUMN_DEFAULT !== 'normal'
+  ) {
+    throw migration010Error("visitor_messages.priority must be ENUM('urgent','high','normal','low') NOT NULL DEFAULT 'normal'.");
+  }
+
+  const priorityReasonCol = msgColMap.get('priority_reason');
+  if (!priorityReasonCol || priorityReasonCol.COLUMN_TYPE.toLowerCase() !== 'varchar(255)' || priorityReasonCol.IS_NULLABLE !== 'YES') {
+    throw migration010Error('visitor_messages.priority_reason must be VARCHAR(255) NULL.');
+  }
+
+  const priorityOverriddenCol = msgColMap.get('priority_overridden');
+  if (
+    !priorityOverriddenCol ||
+    (priorityOverriddenCol.COLUMN_TYPE.toLowerCase() !== 'tinyint(1)' && priorityOverriddenCol.COLUMN_TYPE.toLowerCase() !== 'boolean') ||
+    priorityOverriddenCol.IS_NULLABLE !== 'NO' ||
+    (priorityOverriddenCol.COLUMN_DEFAULT !== '0' && priorityOverriddenCol.COLUMN_DEFAULT !== 'b\'0\'')
+  ) {
+    throw migration010Error('visitor_messages.priority_overridden must be BOOLEAN NOT NULL DEFAULT FALSE.');
+  }
+
+  const isAutoReplyCol = msgColMap.get('is_auto_reply');
+  if (
+    !isAutoReplyCol ||
+    (isAutoReplyCol.COLUMN_TYPE.toLowerCase() !== 'tinyint(1)' && isAutoReplyCol.COLUMN_TYPE.toLowerCase() !== 'boolean') ||
+    isAutoReplyCol.IS_NULLABLE !== 'NO' ||
+    (isAutoReplyCol.COLUMN_DEFAULT !== '0' && isAutoReplyCol.COLUMN_DEFAULT !== 'b\'0\'')
+  ) {
+    throw migration010Error('visitor_messages.is_auto_reply must be BOOLEAN NOT NULL DEFAULT FALSE.');
+  }
+
+  // 3. Verify visitor_sessions table columns
+  const [sessionCols] = await connection.query(
+    `SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, GENERATION_EXPRESSION
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'visitor_sessions'
+       AND COLUMN_NAME IN ('session_priority', 'priority_overridden', 'last_auto_reply_status', 'last_auto_reply_version')`
+  );
+  const sessionColMap = new Map(sessionCols.map((c) => [c.COLUMN_NAME, c]));
+
+  const sessionPriorityCol = sessionColMap.get('session_priority');
+  if (
+    !sessionPriorityCol ||
+    !sessionPriorityCol.COLUMN_TYPE.toLowerCase().includes("enum('urgent','high','normal','low')") ||
+    sessionPriorityCol.IS_NULLABLE !== 'NO' ||
+    sessionPriorityCol.COLUMN_DEFAULT !== 'normal'
+  ) {
+    throw migration010Error("visitor_sessions.session_priority must be ENUM('urgent','high','normal','low') NOT NULL DEFAULT 'normal'.");
+  }
+
+  const sessionOverriddenCol = sessionColMap.get('priority_overridden');
+  if (
+    !sessionOverriddenCol ||
+    (sessionOverriddenCol.COLUMN_TYPE.toLowerCase() !== 'tinyint(1)' && sessionOverriddenCol.COLUMN_TYPE.toLowerCase() !== 'boolean') ||
+    sessionOverriddenCol.IS_NULLABLE !== 'NO' ||
+    (sessionOverriddenCol.COLUMN_DEFAULT !== '0' && sessionOverriddenCol.COLUMN_DEFAULT !== 'b\'0\'')
+  ) {
+    throw migration010Error('visitor_sessions.priority_overridden must be BOOLEAN NOT NULL DEFAULT FALSE.');
+  }
+
+  const lastAutoReplyCol = sessionColMap.get('last_auto_reply_status');
+  if (
+    !lastAutoReplyCol ||
+    !lastAutoReplyCol.COLUMN_TYPE.toLowerCase().includes("enum('available','busy','away')") ||
+    lastAutoReplyCol.IS_NULLABLE !== 'YES'
+  ) {
+    throw migration010Error("visitor_sessions.last_auto_reply_status must be ENUM('available','busy','away') NULL.");
+  }
+
+  const lastAutoReplyVersionCol = sessionColMap.get('last_auto_reply_version');
+  if (
+    !lastAutoReplyVersionCol ||
+    lastAutoReplyVersionCol.COLUMN_TYPE.toLowerCase() !== 'int unsigned' ||
+    lastAutoReplyVersionCol.IS_NULLABLE !== 'YES'
+  ) {
+    throw migration010Error('visitor_sessions.last_auto_reply_version must be INT UNSIGNED NULL.');
+  }
+
+  // 4. Verify exact index definitions & column orders
+  const [msgIdx] = await connection.query(
+    `SELECT NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME, SUB_PART, INDEX_TYPE, IS_VISIBLE
+     FROM information_schema.STATISTICS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'visitor_messages' AND INDEX_NAME = 'idx_visitor_messages_priority'
+     ORDER BY SEQ_IN_INDEX`
+  );
+  if (
+    msgIdx.length !== 2 ||
+    Number(msgIdx[0].NON_UNIQUE) !== 1 ||
+    Number(msgIdx[0].SEQ_IN_INDEX) !== 1 ||
+    msgIdx[0].COLUMN_NAME !== 'session_id' ||
+    msgIdx[0].SUB_PART !== null ||
+    String(msgIdx[0].INDEX_TYPE).toUpperCase() !== 'BTREE' ||
+    String(msgIdx[0].IS_VISIBLE).toUpperCase() !== 'YES' ||
+    Number(msgIdx[1].NON_UNIQUE) !== 1 ||
+    Number(msgIdx[1].SEQ_IN_INDEX) !== 2 ||
+    msgIdx[1].COLUMN_NAME !== 'priority' ||
+    msgIdx[1].SUB_PART !== null ||
+    String(msgIdx[1].INDEX_TYPE).toUpperCase() !== 'BTREE' ||
+    String(msgIdx[1].IS_VISIBLE).toUpperCase() !== 'YES'
+  ) {
+    throw migration010Error('index idx_visitor_messages_priority on visitor_messages must be a visible, non-prefix BTREE index on (session_id, priority).');
+  }
+
+  const [sessionIdx] = await connection.query(
+    `SELECT NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME, SUB_PART, INDEX_TYPE, IS_VISIBLE
+     FROM information_schema.STATISTICS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'visitor_sessions' AND INDEX_NAME = 'idx_visitor_sessions_priority'
+     ORDER BY SEQ_IN_INDEX`
+  );
+  if (
+    sessionIdx.length !== 2 ||
+    Number(sessionIdx[0].NON_UNIQUE) !== 1 ||
+    Number(sessionIdx[0].SEQ_IN_INDEX) !== 1 ||
+    sessionIdx[0].COLUMN_NAME !== 'session_priority' ||
+    sessionIdx[0].SUB_PART !== null ||
+    String(sessionIdx[0].INDEX_TYPE).toUpperCase() !== 'BTREE' ||
+    String(sessionIdx[0].IS_VISIBLE).toUpperCase() !== 'YES' ||
+    Number(sessionIdx[1].NON_UNIQUE) !== 1 ||
+    Number(sessionIdx[1].SEQ_IN_INDEX) !== 2 ||
+    sessionIdx[1].COLUMN_NAME !== 'created_at' ||
+    sessionIdx[1].SUB_PART !== null ||
+    String(sessionIdx[1].INDEX_TYPE).toUpperCase() !== 'BTREE' ||
+    String(sessionIdx[1].IS_VISIBLE).toUpperCase() !== 'YES'
+  ) {
+    throw migration010Error('index idx_visitor_sessions_priority on visitor_sessions must be a visible, non-prefix BTREE index on (session_priority, created_at).');
   }
 }
 

@@ -17,6 +17,7 @@ import {
   acceptVisitorSession,
   closeOwnerVisitorSession,
   markSessionAsRead,
+  updateSessionPriority,
 } from '../../services/vehicleService';
 
 export default function OwnerConversationModal({
@@ -32,7 +33,23 @@ export default function OwnerConversationModal({
   const [replyText, setReplyText] = useState('');
   const [sending, setSending] = useState(false);
   const [actionLoading, setActionLoading] = useState(false);
+  const [priorityLoading, setPriorityLoading] = useState(false);
   const [sessionState, setSessionState] = useState(session || {});
+
+  const handlePriorityChange = async (newPriority) => {
+    if (!effectiveSessionId || sessionState.priority === newPriority || priorityLoading) return;
+    setPriorityLoading(true);
+    try {
+      await updateSessionPriority(effectiveSessionId, newPriority);
+      const updated = { ...sessionState, priority: newPriority, priorityOverridden: true };
+      setSessionState(updated);
+      if (onSessionUpdated) onSessionUpdated(updated);
+    } catch (err) {
+      setError(err.message || 'Failed to update priority');
+    } finally {
+      setPriorityLoading(false);
+    }
+  };
 
   const messagesEndRef = useRef(null);
   const pollingRef = useRef(null);
@@ -280,6 +297,22 @@ export default function OwnerConversationModal({
                 >
                   {sessionState.status}
                 </span>
+
+                {/* Priority Badge */}
+                <span
+                  className={`uppercase px-2 py-0.5 rounded text-[10px] font-semibold shrink-0 border ${
+                    sessionState.priority === 'urgent'
+                      ? 'bg-red-500/20 text-red-400 border-red-500/40'
+                      : sessionState.priority === 'high'
+                      ? 'bg-amber-500/20 text-amber-400 border-amber-500/40'
+                      : sessionState.priority === 'low'
+                      ? 'bg-neutral-800 text-neutral-400 border-neutral-700'
+                      : 'bg-sky-500/20 text-sky-400 border-sky-500/40'
+                  }`}
+                >
+                  {sessionState.priority || 'normal'}
+                  {sessionState.priorityOverridden && ' *'}
+                </span>
               </div>
 
               <p className="text-[11px] font-mono text-neutral-400 truncate">
@@ -297,11 +330,35 @@ export default function OwnerConversationModal({
           </button>
         </div>
 
-        {/* Action Banner: Lifecycle Controls */}
-        <div className="px-5 py-2.5 bg-white/[0.015] border-b border-white/[0.06] flex items-center justify-between text-xs font-mono">
-          <div className="flex items-center space-x-2 text-neutral-400 text-[11px]">
-            <Clock className="w-3.5 h-3.5" />
-            <span>Created: {new Date(sessionState.createdAt || Date.now()).toLocaleTimeString()}</span>
+        {/* Action Banner: Lifecycle Controls & Priority Override */}
+        <div className="px-5 py-2.5 bg-white/[0.015] border-b border-white/[0.06] flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+          <div className="flex items-center space-x-3 text-neutral-400 text-[11px]">
+            <div className="flex items-center space-x-1">
+              <Clock className="w-3.5 h-3.5" />
+              <span>Created: {new Date(sessionState.createdAt || Date.now()).toLocaleTimeString()}</span>
+            </div>
+
+            {/* Inline Priority Override */}
+            <div className="flex items-center space-x-1.5 pl-2 border-l border-white/[0.08]">
+              <span className="text-[10px] text-neutral-500 uppercase">Priority:</span>
+              <div className="flex items-center space-x-1">
+                {['urgent', 'high', 'normal', 'low'].map((p) => (
+                  <button
+                    key={p}
+                    type="button"
+                    disabled={priorityLoading || sessionState.priority === p}
+                    onClick={() => handlePriorityChange(p)}
+                    className={`px-1.5 py-0.5 rounded text-[10px] uppercase font-mono transition-colors ${
+                      sessionState.priority === p
+                        ? 'bg-white/20 text-white font-bold'
+                        : 'text-neutral-500 hover:text-neutral-300 hover:bg-white/[0.05]'
+                    }`}
+                  >
+                    {p}
+                  </button>
+                ))}
+              </div>
+            </div>
           </div>
 
           <div className="flex items-center space-x-2">
@@ -366,6 +423,26 @@ export default function OwnerConversationModal({
                     <span className="font-semibold text-neutral-300">
                       {isOwner ? 'You (Owner)' : 'Visitor'}
                     </span>
+                    {m.isAutoReply && (
+                      <span className="px-1.5 py-0.5 rounded text-[9px] bg-purple-500/20 text-purple-300 border border-purple-500/30">
+                        Auto-reply
+                      </span>
+                    )}
+                    {!isOwner && m.priority && (
+                      <span
+                        className={`uppercase px-1.5 py-0.5 rounded text-[9px] font-semibold border ${
+                          m.priority === 'urgent'
+                            ? 'bg-red-500/20 text-red-400 border-red-500/40'
+                            : m.priority === 'high'
+                            ? 'bg-amber-500/20 text-amber-400 border-amber-500/40'
+                            : m.priority === 'low'
+                            ? 'bg-neutral-800 text-neutral-400 border-neutral-700'
+                            : 'bg-sky-500/20 text-sky-400 border-sky-500/40'
+                        }`}
+                      >
+                        {m.priority}
+                      </span>
+                    )}
                     <span>•</span>
                     <span>{new Date(m.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                   </div>
@@ -379,6 +456,12 @@ export default function OwnerConversationModal({
                   >
                     {m.body}
                   </div>
+
+                  {!isOwner && m.priorityReason && !m.priorityReason.toLowerCase().includes('default') && (
+                    <div className="px-2 pt-1 text-[10px] font-mono text-neutral-400">
+                      <span className="text-neutral-500">AI intent:</span> {m.priorityReason}
+                    </div>
+                  )}
                 </div>
               );
             })

@@ -184,7 +184,7 @@ export async function sendPushNotificationToUser(pool, userId, payloadString, { 
   return { sent, failed, removed };
 }
 
-export async function sendPushNotificationForSession({ pool, vehicleId, sessionId, logger = console }) {
+export async function sendPushNotificationForSession({ pool, vehicleId, sessionId, logger = console, priority = 'normal' }) {
   try {
     const [vehicles] = await pool.query(
       `SELECT user_id, registration_number, vehicle_model
@@ -199,14 +199,22 @@ export async function sendPushNotificationForSession({ pool, vehicleId, sessionI
     }
 
     const vehicle = vehicles[0];
+    const safePriority = String(priority || 'normal').toLowerCase();
+    const priorityPrefix = safePriority === 'urgent'
+      ? '[URGENT] '
+      : safePriority === 'high'
+        ? '[HIGH PRIORITY] '
+        : '';
+
     const payload = JSON.stringify({
-      title: 'New visitor message',
+      title: `${priorityPrefix}New visitor message`,
       body: `Vehicle ${vehicle.registration_number}: You received a new message.`,
       tag: `session-${sessionId}`,
       data: {
         sessionId,
         vehicleId,
         registrationNumber: vehicle.registration_number,
+        priority: safePriority,
         url: `/vehicles?openSession=${sessionId}`,
       },
     });

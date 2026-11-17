@@ -5,7 +5,7 @@ import express from 'express';
 import session from 'express-session';
 import rateLimit from 'express-rate-limit';
 import mysql from 'mysql2/promise';
-import { applyMigrations, verifyVisitorSessionsSchema, verifyVisitorMessagesSchema, verifyOwnerNotificationsSchema } from '../src/migrate.js';
+import { applyMigrations, verifyVisitorSessionsSchema, verifyVisitorMessagesSchema, verifyOwnerNotificationsSchema, verifyAiPriorityAndAvailabilitySchema } from '../src/migrate.js';
 import { createVehiclesRouter } from '../src/routes/vehicles.js';
 import { createPublicRouter } from '../src/routes/public.js';
 import { runVisitorSessionCleanup } from '../src/services/sessionCleanup.js';
@@ -2503,6 +2503,271 @@ test('MySQL migration and vehicle integrity integration', { skip: !enabled }, as
           ['https://push.example.test/sub/1']
         );
         assert.equal(remainingSubs.length, 0, 'push_subscriptions must be deleted via ON DELETE CASCADE when user is deleted');
+      } finally {
+        conn.release();
+      }
+    });
+  });
+
+  await t.test('real MySQL Phase 3.5: AI priority, availability persistence, auto-replies, and inbox sorting', async (t) => {
+    await withDatabase(t, async (pool) => {
+      await migrate(pool);
+      const conn = await pool.getConnection();
+      try {
+        // 1. Availability defaults to 'available' and persists changes
+        const email = `owner35_${Date.now()}@example.test`;
+        const [userResult] = await pool.query(
+          "INSERT INTO users (email, password_hash, full_name) VALUES (?, 'hash', 'Owner 3.5')",
+          [email]
+        );
+        const ownerId = userResult.insertId;
+
+        const [uRow1] = await pool.query('SELECT availability_status, auto_reply_enabled, availability_version FROM users WHERE id = ?', [ownerId]);
+        assert.equal(uRow1[0].availability_status, 'available');
+        assert.equal(Boolean(uRow1[0].auto_reply_enabled), false);
+        assert.equal(Number(uRow1[0].availability_version), 1);
+
+        // Update to busy with auto-reply enabled and increment version
+        await pool.query(
+          "UPDATE users SET availability_status = 'busy', availability_version = availability_version + 1, auto_reply_enabled = TRUE, auto_reply_busy = 'Busy right now' WHERE id = ?",
+          [ownerId]
+        );
+
+        // 2. Insert vehicle and visitor session
+        const regNum = 'KA35' + Math.random().toString(16).slice(2, 6).toUpperCase();
+        const [vehResult] = await pool.query(
+          "INSERT INTO vehicles (user_id, registration_number, vehicle_type, vehicle_model, color) VALUES (?, ?, 'car', 'Sedan', 'White')",
+          [ownerId, regNum]
+        );
+        const vehicleId = vehResult.insertId;
+
+        const pubSessionId = 'vs_' + Math.random().toString(16).slice(2).padStart(24, '0') + Math.random().toString(16).slice(2).padStart(24, '0');
+        const [sessResult] = await pool.query(
+          `INSERT INTO visitor_sessions (public_id, vehicle_id, credential_hash, status, session_priority, expires_at)
+           VALUES (?, ?, REPEAT('c', 64), 'pending', 'normal', DATE_ADD(NOW(), INTERVAL 1 DAY))`,
+          [pubSessionId, vehicleId]
+        );
+        const sessionDbId = sessResult.insertId;
+
+        // 3. Test auto-reply dispatch
+        const { handleAutoReplyForSession } = await import('../src/services/autoReply.js');
+
+        // First message: dispatches busy auto-reply
+        const auto1 = await handleAutoReplyForSession({
+          pool,
+          sessionDbId,
+          sessionId: pubSessionId,
+          vehicleId,
+        });
+        assert.equal(auto1.sent, true);
+        assert.equal(auto1.body, 'Busy right now');
+
+        // Verify message inserted in visitor_messages
+        const [msgRows] = await pool.query(
+          'SELECT sender_type, body, is_auto_reply FROM visitor_messages WHERE session_id = ?',
+          [sessionDbId]
+        );
+        assert.equal(msgRows.length, 1);
+        assert.equal(msgRows[0].sender_type, 'owner');
+        assert.equal(Boolean(msgRows[0].is_auto_reply), true);
+
+        // Second message under same status/version: blocked by anti-spam
+        const auto2 = await handleAutoReplyForSession({
+          pool,
+          sessionDbId,
+          sessionId: pubSessionId,
+          vehicleId,
+        });
+        assert.equal(auto2.sent, false);
+        assert.equal(auto2.reason, 'already_sent_for_period');
+
+        // Transition: BUSY -> AVAILABLE -> BUSY (new period with incremented version)
+        await pool.query(
+          "UPDATE users SET availability_status = 'available', availability_version = availability_version + 1 WHERE id = ?",
+          [ownerId]
+        );
+        await pool.query(
+          "UPDATE users SET availability_status = 'busy', availability_version = availability_version + 1, auto_reply_busy = 'Busy in second period' WHERE id = ?",
+          [ownerId]
+        );
+
+        // A new auto-reply is permitted for the second busy period!
+        const auto3 = await handleAutoReplyForSession({
+          pool,
+          sessionDbId,
+          sessionId: pubSessionId,
+          vehicleId,
+        });
+        assert.equal(auto3.sent, true);
+        assert.equal(auto3.body, 'Busy in second period');
+
+        // 4. Test priority sorting: urgent > high > normal > low
+        const sidUrgent = 'vs_' + 'u'.repeat(48);
+        const sidHigh = 'vs_' + 'h'.repeat(48);
+        const sidLow = 'vs_' + 'l'.repeat(48);
+
+        await pool.query(
+          `INSERT INTO visitor_sessions (public_id, vehicle_id, credential_hash, status, session_priority, expires_at)
+           VALUES (?, ?, REPEAT('d', 64), 'pending', 'urgent', DATE_ADD(NOW(), INTERVAL 1 DAY)),
+                  (?, ?, REPEAT('e', 64), 'pending', 'high', DATE_ADD(NOW(), INTERVAL 1 DAY)),
+                  (?, ?, REPEAT('f', 64), 'pending', 'low', DATE_ADD(NOW(), INTERVAL 1 DAY))`,
+          [sidUrgent, vehicleId, sidHigh, vehicleId, sidLow, vehicleId]
+        );
+
+        const [sortedRows] = await pool.query(
+          `SELECT public_id, session_priority
+           FROM visitor_sessions
+           WHERE vehicle_id = ?
+           ORDER BY FIELD(session_priority, 'urgent', 'high', 'normal', 'low'), created_at DESC`,
+          [vehicleId]
+        );
+
+        assert.equal(sortedRows[0].session_priority, 'urgent');
+        assert.equal(sortedRows[1].session_priority, 'high');
+        assert.equal(sortedRows[2].session_priority, 'normal');
+        assert.equal(sortedRows[3].session_priority, 'low');
+
+        // 5. Concurrent auto-reply attempts on the same session
+        // Only one should succeed; the second should be safely rejected with 'already_sent_for_period'
+        const pubSessionConc = 'vs_' + Math.random().toString(16).slice(2).padStart(24, '0') + Math.random().toString(16).slice(2).padStart(24, '0');
+        const [sessConcResult] = await pool.query(
+          `INSERT INTO visitor_sessions (public_id, vehicle_id, credential_hash, status, session_priority, expires_at)
+           VALUES (?, ?, REPEAT('a', 64), 'pending', 'normal', DATE_ADD(NOW(), INTERVAL 1 DAY))`,
+          [pubSessionConc, vehicleId]
+        );
+        const sessionConcId = sessConcResult.insertId;
+
+        const [res1, res2] = await Promise.all([
+          handleAutoReplyForSession({ pool, sessionDbId: sessionConcId, sessionId: pubSessionConc, vehicleId }),
+          handleAutoReplyForSession({ pool, sessionDbId: sessionConcId, sessionId: pubSessionConc, vehicleId }),
+        ]);
+
+        const sentResults = [res1, res2].filter((r) => r.sent);
+        const rejectedResults = [res1, res2].filter((r) => !r.sent);
+        assert.equal(sentResults.length, 1, 'Exactly one concurrent auto-reply must succeed');
+        assert.equal(rejectedResults.length, 1, 'Exactly one concurrent auto-reply must be rejected');
+        assert.equal(rejectedResults[0].reason, 'already_sent_for_period');
+
+        const [concMsgs] = await pool.query(
+          'SELECT id FROM visitor_messages WHERE session_id = ? AND is_auto_reply = TRUE',
+          [sessionConcId]
+        );
+        assert.equal(concMsgs.length, 1, 'Only one auto-reply message must be persisted');
+
+        // 6. Session expiry racing with auto-reply
+        // Even if status is 'pending' or 'accepted', an expired session (expires_at in past) must be rejected
+        const pubSessionExp = 'vs_' + Math.random().toString(16).slice(2).padStart(24, '0') + Math.random().toString(16).slice(2).padStart(24, '0');
+        const [sessExpResult] = await pool.query(
+          `INSERT INTO visitor_sessions (public_id, vehicle_id, credential_hash, status, session_priority, expires_at)
+           VALUES (?, ?, REPEAT('b', 64), 'accepted', 'normal', DATE_SUB(NOW(), INTERVAL 1 MINUTE))`,
+          [pubSessionExp, vehicleId]
+        );
+        const sessionExpId = sessExpResult.insertId;
+
+        const autoExp = await handleAutoReplyForSession({
+          pool,
+          sessionDbId: sessionExpId,
+          sessionId: pubSessionExp,
+          vehicleId,
+        });
+        assert.equal(autoExp.sent, false);
+        assert.equal(autoExp.reason, 'session_expired');
+
+        const [expMsgs] = await pool.query(
+          'SELECT id FROM visitor_messages WHERE session_id = ? AND is_auto_reply = TRUE',
+          [sessionExpId]
+        );
+        assert.equal(expMsgs.length, 0, 'No auto-reply message should be inserted for expired session');
+
+        // 7. Repeated availability update with same status exercises the actual production PATCH route
+        const harness = await makeApp(pool);
+        t.after(() => harness.server.close());
+        const ownerCookie = await sessionFor(harness.base, ownerId);
+
+        const [uBefore] = await pool.query('SELECT availability_status, availability_version FROM users WHERE id = ?', [ownerId]);
+        const verBefore = Number(uBefore[0].availability_version);
+        const curStatus = uBefore[0].availability_status; // 'busy'
+
+        // Send PATCH /api/vehicles/availability with same status 'busy' via actual production route
+        const patchSameRes = await request(harness.base, ownerCookie, 'PATCH', '/availability', {
+          status: curStatus,
+          autoReplyBusy: 'Updated busy note via production route',
+        });
+        assert.equal(patchSameRes.status, 200);
+        const patchSameData = await patchSameRes.json();
+        assert.equal(patchSameData.status, curStatus);
+
+        const [uAfterSame] = await pool.query('SELECT availability_version, auto_reply_busy FROM users WHERE id = ?', [ownerId]);
+        assert.equal(Number(uAfterSame[0].availability_version), verBefore, 'Version must NOT increment when status is repeated');
+        assert.equal(uAfterSame[0].auto_reply_busy, 'Updated busy note via production route');
+
+        // Now send PATCH /api/vehicles/availability changing status: 'busy' -> 'away' via actual production route
+        const patchDiffRes = await request(harness.base, ownerCookie, 'PATCH', '/availability', {
+          status: 'away',
+        });
+        assert.equal(patchDiffRes.status, 200);
+        const patchDiffData = await patchDiffRes.json();
+        assert.equal(patchDiffData.status, 'away');
+
+        const [uAfterDiff] = await pool.query('SELECT availability_version, availability_status FROM users WHERE id = ?', [ownerId]);
+        assert.equal(uAfterDiff[0].availability_status, 'away');
+        assert.equal(Number(uAfterDiff[0].availability_version), verBefore + 1, 'Version MUST increment when status actually changes');
+
+        // 8. Manual priority override racing with AI classification
+        const { classifyAndStoreMessagePriority, setAiClassifierForTesting, resetAiClassifierForTesting } = await import('../src/services/aiPriority.js');
+
+        const [msgResult] = await pool.query(
+          `INSERT INTO visitor_messages (session_id, sender_type, body, priority, priority_reason, priority_overridden)
+           VALUES (?, 'visitor', 'My car is blocked please move', 'normal', 'Default priority', FALSE)`,
+          [sessionDbId]
+        );
+        const testMsgId = msgResult.insertId;
+
+        // Owner manually marks this message as URGENT before delayed AI classification completes
+        await pool.query(
+          `UPDATE visitor_messages
+           SET priority = 'urgent', priority_reason = 'Owner manual override', priority_overridden = TRUE
+           WHERE id = ?`,
+          [testMsgId]
+        );
+        await pool.query(
+          `UPDATE visitor_sessions
+           SET session_priority = 'urgent', priority_overridden = TRUE
+           WHERE id = ?`,
+          [sessionDbId]
+        );
+
+        // AI classification finishes late and proposed 'low'
+        setAiClassifierForTesting(async () => ({
+          priority: 'low',
+          reason: 'AI thought it was low',
+        }));
+
+        const classifyResult = await classifyAndStoreMessagePriority({
+          pool,
+          messageId: testMsgId,
+          sessionDbId,
+          body: 'My car is blocked please move',
+        });
+        resetAiClassifierForTesting();
+
+        // Message priority in DB must remain URGENT (not overwritten by AI 'low')
+        const [persistedMsg] = await pool.query('SELECT priority, priority_overridden FROM visitor_messages WHERE id = ?', [testMsgId]);
+        assert.equal(persistedMsg[0].priority, 'urgent');
+        assert.equal(Boolean(persistedMsg[0].priority_overridden), true);
+
+        // Session priority must remain URGENT
+        const [persistedSess] = await pool.query('SELECT session_priority, priority_overridden FROM visitor_sessions WHERE id = ?', [sessionDbId]);
+        assert.equal(persistedSess[0].session_priority, 'urgent');
+
+        // classifyAndStoreMessagePriority returns the persisted priority for push notification
+        assert.equal(classifyResult.priority, 'urgent');
+        assert.equal(classifyResult.messagePriority, 'urgent');
+
+        // 9. Real MySQL schema verification for Migration 010
+        await assert.doesNotReject(async () => {
+          await verifyAiPriorityAndAvailabilitySchema(conn);
+        });
       } finally {
         conn.release();
       }
